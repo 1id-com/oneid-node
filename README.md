@@ -119,7 +119,7 @@ try {
 The SDK uses a two-tier architecture:
 
 1. **TypeScript SDK** (this package) — handles enrollment orchestration, credential storage, OAuth2 token management, and software key operations using Node.js built-in `crypto`
-2. **Go binary** (`oneid-enroll`) — handles all TPM/HSM hardware operations. Auto-downloaded from [GitHub releases](https://github.com/AuraFriday/oneid-enroll/releases) when needed
+2. **Go binary** (`oneid-enroll`) — handles all TPM/HSM hardware operations. Auto-downloaded from [GitHub releases](https://github.com/1id-com/oneid-enroll/releases) when needed
 
 For `declared` tier enrollment, only the TypeScript SDK is needed. For `sovereign` (TPM) tier, the Go binary is automatically fetched.
 
@@ -150,4 +150,4 @@ Apache 2.0 — see [LICENSE](LICENSE).
 - [1id.com](https://1id.com) — Service homepage
 - [Enrollment guide](https://1id.com/enroll.md) — Machine-readable enrollment instructions
 - [Python SDK](https://pypi.org/project/oneid/) — `pip install oneid`
-- [Go binary](https://github.com/AuraFriday/oneid-enroll) — TPM/HSM helper
+- [Go binary](https://github.com/1id-com/oneid-enroll) — TPM/HSM helper

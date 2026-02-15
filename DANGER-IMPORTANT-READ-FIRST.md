@@ -34,7 +34,7 @@ make github-site     # sync 1id.com only
 
 | GitHub repo | Source folder | What it contains |
 |-------------|--------------|------------------|
-| `AuraFriday/oneid-sdk` | `sdk/oneid-sdk/` | Python SDK (PyPI: `oneid-sdk`) |
-| `AuraFriday/oneid-enroll` | `sdk/oneid-enroll/` | Go binary for TPM/HSM operations |
-| `AuraFriday/oneid-node` | *(future)* | Node.js SDK |
-| `AuraFriday/1id.com` | `public_html/`, `api/`, `keycloak-spi/`, `config/` | Website + API + Keycloak SPI |
+| `1id-com/oneid-sdk` | `sdk/oneid-sdk/` | Python SDK (PyPI: `oneid-sdk`) |
+| `1id-com/oneid-enroll` | `sdk/oneid-enroll/` | Go binary for TPM/HSM operations |
+| `1id-com/oneid-node` | *(future)* | Node.js SDK |
+| `1id-com/1id.com` | `public_html/`, `api/`, `keycloak-spi/`, `config/` | Website + API + Keycloak SPI |

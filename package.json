@@ -16,10 +16,10 @@
   "homepage": "https://1id.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AuraFriday/oneid-node.git"
+    "url": "https://github.com/1id-com/oneid-node.git"
   },
   "bugs": {
-    "url": "https://github.com/AuraFriday/oneid-node/issues"
+    "url": "https://github.com/1id-com/oneid-node/issues"
   },
   "license": "Apache-2.0",
   "author": "Christopher Drake <chris@1id.com>",
