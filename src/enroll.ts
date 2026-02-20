@@ -111,6 +111,13 @@ export async function enroll(options: EnrollOptions): Promise<Identity> {
       resolved_key_algorithm,
       api_base_url,
     );
+  } else if (tier === TrustTier.SOVEREIGN_PORTABLE) {
+    return enroll_piv_tier(
+      tier,
+      options.operator_email ?? null,
+      options.requested_handle ?? null,
+      api_base_url,
+    );
   } else if (TIERS_REQUIRING_HSM.has(tier)) {
     return enroll_hsm_tier(
       tier,
@@ -184,6 +191,126 @@ async function enroll_declared_tier(
     enrolled_at,
     device_count: 0,
     key_algorithm,
+  };
+}
+
+/**
+ * Enroll at the sovereign-portable tier using a PIV device (YubiKey).
+ *
+ * This uses the Go binary (oneid-enroll) to:
+ * 1. Detect available HSMs and select a PIV device
+ * 2. Extract PIV attestation data (no elevation needed)
+ * 3. Send attestation to the PIV-specific server endpoint
+ * 4. Receive a nonce challenge
+ * 5. Sign the nonce with the PIV key (no elevation needed)
+ * 6. Send the signed nonce to the activate endpoint
+ * 7. Receive identity + OAuth2 credentials
+ * 8. Store credentials locally
+ */
+async function enroll_piv_tier(
+  request_tier: TrustTier,
+  operator_email: string | null,
+  requested_handle: string | null,
+  api_base_url: string,
+): Promise<Identity> {
+  const {
+    detect_available_hsms,
+    extract_attestation_data,
+    sign_challenge_with_piv,
+  } = await import("./helper.js");
+
+  const detected_hsms = await detect_available_hsms();
+  if (detected_hsms.length === 0) {
+    throw new NoHSMError(
+      `No hardware security module found. ` +
+      `The '${request_tier}' tier requires a YubiKey or similar PIV device.`
+    );
+  }
+
+  const selected_hsm = select_hsm_for_tier(detected_hsms, request_tier);
+  if (selected_hsm == null) {
+    const hsm_types = detected_hsms.map(h => (h.type as string) ?? "unknown").join(", ");
+    throw new NoHSMError(
+      `Found HSM(s) (${hsm_types}) but none are compatible with the '${request_tier}' tier.`
+    );
+  }
+
+  const attestation_data = await extract_attestation_data(selected_hsm);
+
+  const api_client = new OneIDAPIClient(api_base_url);
+  const begin_response = await api_client.enroll_begin_piv(
+    attestation_data.attestation_cert_pem as string,
+    (attestation_data.attestation_chain_pem as string[]) ?? [],
+    attestation_data.signing_key_public_pem as string,
+    (selected_hsm.type as string) ?? "yubikey",
+    operator_email,
+    requested_handle,
+  );
+
+  const nonce_challenge_b64 = begin_response.nonce_challenge as string;
+
+  const sign_result = await sign_challenge_with_piv(nonce_challenge_b64);
+  const signed_nonce_b64 = sign_result.signature_b64 as string;
+
+  const activate_response = await api_client.enroll_activate(
+    begin_response.enrollment_session_id as string,
+    signed_nonce_b64,
+  );
+
+  const identity_data = (activate_response.identity ?? {}) as Record<string, unknown>;
+  const credentials_data = (activate_response.credentials ?? {}) as Record<string, unknown>;
+
+  const internal_id = (identity_data.internal_id as string) ?? "";
+  const handle = (identity_data.handle as string) ?? `@${internal_id.slice(0, 12)}`;
+  const trust_tier_str = (identity_data.trust_tier as string) ?? request_tier;
+  const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
+
+  const stored_credentials: StoredCredentials = {
+    client_id: (credentials_data.client_id as string) ?? internal_id,
+    client_secret: (credentials_data.client_secret as string) ?? "",
+    token_endpoint: (credentials_data.token_endpoint as string) ??
+      `${api_base_url}/realms/agents/protocol/openid-connect/token`,
+    api_base_url,
+    trust_tier: trust_tier_str,
+    key_algorithm: "ecdsa-p256",
+    hsm_key_reference: "piv-slot-9a",
+    enrolled_at: enrolled_at_str,
+  };
+  save_credentials(stored_credentials);
+
+  let enrolled_at: Date;
+  try {
+    enrolled_at = new Date(enrolled_at_str);
+  } catch {
+    enrolled_at = new Date();
+  }
+
+  let trust_tier: TrustTier;
+  const valid_tiers = Object.values(TrustTier) as string[];
+  if (valid_tiers.includes(trust_tier_str)) {
+    trust_tier = trust_tier_str as TrustTier;
+  } else {
+    trust_tier = request_tier;
+  }
+
+  let hsm_type: HSMType;
+  const hsm_type_str = (selected_hsm.type as string) ?? "yubikey";
+  const valid_hsm_types = Object.values(HSMType) as string[];
+  if (valid_hsm_types.includes(hsm_type_str)) {
+    hsm_type = hsm_type_str as HSMType;
+  } else {
+    hsm_type = HSMType.YUBIKEY;
+  }
+
+  return {
+    internal_id,
+    handle,
+    trust_tier,
+    hsm_type,
+    hsm_manufacturer: (selected_hsm.manufacturer as string) ?? null,
+    enrolled_at,
+    device_count: (identity_data.device_count as number) ?? 1,
+    key_algorithm: KeyAlgorithm.ECDSA_P256,
   };
 }
 

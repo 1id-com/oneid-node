@@ -39,7 +39,7 @@ export interface GeneratedKeypair {
  * @throws Error if the algorithm is not supported.
  */
 export function generate_keypair(algorithm: KeyAlgorithm = KeyAlgorithm.ED25519): GeneratedKeypair {
-  let key_pair: crypto.KeyPairKeyObjectResult;
+  let key_pair: { publicKey: crypto.KeyObject; privateKey: crypto.KeyObject };
 
   if (algorithm === KeyAlgorithm.ED25519) {
     key_pair = crypto.generateKeyPairSync("ed25519");

@@ -30,7 +30,7 @@ import {
 
 // -- GitHub release URL for auto-download --
 const GITHUB_RELEASE_DOWNLOAD_URL_TEMPLATE =
-  "https://github.com/1id-com/oneid-enroll/releases/latest/download/{binary_name}";
+  "https://github.com/AuraFriday/oneid-enroll/releases/latest/download/{binary_name}";
 
 // -- Binary naming convention --
 const BINARY_NAME_PREFIX = "oneid-enroll";
@@ -40,9 +40,8 @@ const BINARY_NAME_PREFIX = "oneid-enroll";
  */
 function get_platform_binary_name(): string {
   const system = os.platform();
-  let machine = os.arch();
+  let machine: string = os.arch();
 
-  // Normalize architecture names
   if (machine === "x64") { machine = "amd64"; }
   else if (machine === "arm64") { /* already correct */ }
 
@@ -143,7 +142,7 @@ function download_file_to_path(url: string, destination: string, max_redirects: 
     }
 
     const transport = url.startsWith("https:") ? https : http;
-    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.1.0" } }, (res) => {
+    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.3.0" } }, (res) => {
       // Handle redirects (GitHub releases redirect to S3)
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         download_file_to_path(res.headers.location, destination, max_redirects - 1)
@@ -185,7 +184,7 @@ function download_text_from_url(url: string, max_redirects: number = 5): Promise
     }
 
     const transport = url.startsWith("https:") ? https : http;
-    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.1.0" } }, (res) => {
+    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.3.0" } }, (res) => {
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         download_text_from_url(res.headers.location, max_redirects - 1)
           .then(resolve)
@@ -304,7 +303,7 @@ export async function ensure_binary_available(): Promise<string> {
       `oneid-enroll binary not found in cache, current directory, or PATH, ` +
       `and auto-download failed: ${download_error}. ` +
       `Expected filename: ${binary_name}. ` +
-      `Manual download: https://github.com/1id-com/oneid-enroll/releases/latest`
+      `Manual download: https://github.com/AuraFriday/oneid-enroll/releases/latest`
     );
   }
 }
@@ -425,6 +424,24 @@ export async function activate_credential(
     "--elevated",
   ]);
   return (output.decrypted_credential as string) ?? "";
+}
+
+/**
+ * Sign a challenge nonce using the PIV key in slot 9a -- NO ELEVATION NEEDED.
+ *
+ * This is the core of PIV-backed challenge-response during enrollment.
+ * The agent signs the server-provided nonce with the YubiKey's PIV slot 9a
+ * key (ECDSA-SHA256), proving it controls the hardware that was attested.
+ *
+ * PIV slot 9a with pin-policy=NEVER means no human interaction required.
+ */
+export async function sign_challenge_with_piv(
+  nonce_b64: string,
+): Promise<Record<string, unknown>> {
+  return run_binary_command("sign", [
+    "--nonce", nonce_b64,
+    "--type", "yubikey",
+  ]);
 }
 
 /**

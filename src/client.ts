@@ -25,7 +25,7 @@ import {
 
 // -- HTTP client configuration --
 const DEFAULT_HTTP_TIMEOUT_MILLISECONDS = 30_000;
-const USER_AGENT = "oneid-sdk-node/0.1.0";
+const USER_AGENT = "oneid-sdk-node/0.3.0";
 
 interface RequestOptions {
   method: string;
@@ -195,6 +195,34 @@ export class OneIDAPIClient {
     if (requested_handle != null) { request_body["requested_handle"] = requested_handle; }
 
     return this._make_request("POST", "/api/v1/enroll/begin", request_body);
+  }
+
+  /**
+   * Begin PIV-based enrollment (sovereign-portable tier).
+   *
+   * Sends the PIV attestation certificate, chain, and signing public key
+   * to the PIV-specific server endpoint. The server validates the chain
+   * against the Yubico Root CA, checks the anti-Sybil registry by device
+   * serial, and returns a nonce challenge for signature verification.
+   */
+  async enroll_begin_piv(
+    attestation_cert_pem: string,
+    attestation_chain_pem: string[],
+    signing_key_public_pem: string,
+    hsm_type: string = "yubikey",
+    operator_email?: string | null,
+    requested_handle?: string | null,
+  ): Promise<Record<string, unknown>> {
+    const request_body: Record<string, unknown> = {
+      attestation_cert_pem,
+      attestation_chain_pem,
+      signing_key_public_pem,
+      hsm_type,
+    };
+    if (operator_email != null) { request_body["operator_email"] = operator_email; }
+    if (requested_handle != null) { request_body["requested_handle"] = requested_handle; }
+
+    return this._make_request("POST", "/api/v1/enroll/begin/piv", request_body);
   }
 
   /**

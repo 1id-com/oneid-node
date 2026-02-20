@@ -1,12 +1,14 @@
 {
   "name": "1id",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Hardware-anchored identity SDK for AI agents -- 1id.com",
   "keywords": [
     "identity",
     "ai",
     "agent",
     "tpm",
+    "yubikey",
+    "piv",
     "hardware",
     "oidc",
     "oauth2",
@@ -16,10 +18,10 @@
   "homepage": "https://1id.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/1id-com/oneid-node.git"
+    "url": "https://github.com/AuraFriday/oneid-node.git"
   },
   "bugs": {
-    "url": "https://github.com/1id-com/oneid-node/issues"
+    "url": "https://github.com/AuraFriday/oneid-node/issues"
   },
   "license": "Apache-2.0",
   "author": "Christopher Drake <chris@1id.com>",
@@ -32,9 +34,6 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "bin": {
-    "oneid": "./dist/cli.js"
-  },
   "files": [
     "dist",
     "LICENSE",
@@ -44,13 +43,14 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "build": "npx tsc",
+    "build": "tsc",
     "clean": "node -e \"const fs=require('fs'); fs.rmSync('dist',{recursive:true,force:true})\"",
     "prepublishOnly": "npm run clean && npm run build",
     "test": "node --test dist/test/test_declared_enrollment.js",
     "test:src": "npx tsc && node --test dist/test/test_declared_enrollment.js"
   },
   "devDependencies": {
+    "@types/node": "^25.3.0",
     "typescript": "^5.4"
   }
 }
