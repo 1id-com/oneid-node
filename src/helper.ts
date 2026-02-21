@@ -30,7 +30,7 @@ import {
 
 // -- GitHub release URL for auto-download --
 const GITHUB_RELEASE_DOWNLOAD_URL_TEMPLATE =
-  "https://github.com/AuraFriday/oneid-enroll/releases/latest/download/{binary_name}";
+  "https://github.com/1id-com/oneid-enroll/releases/latest/download/{binary_name}";
 
 // -- Binary naming convention --
 const BINARY_NAME_PREFIX = "oneid-enroll";
@@ -303,7 +303,7 @@ export async function ensure_binary_available(): Promise<string> {
       `oneid-enroll binary not found in cache, current directory, or PATH, ` +
       `and auto-download failed: ${download_error}. ` +
       `Expected filename: ${binary_name}. ` +
-      `Manual download: https://github.com/AuraFriday/oneid-enroll/releases/latest`
+      `Manual download: https://github.com/1id-com/oneid-enroll/releases/latest`
     );
   }
 }

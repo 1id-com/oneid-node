@@ -1,6 +1,6 @@
 # DANGER -- DO NOT EDIT FILES IN THIS FOLDER
 
-**Last synced: 2026-02-12T05:23:41Z**
+**Last synced: 2026-02-21T07:38:29Z**
 
 This folder is a **read-only mirror** of the canonical source tree at
 `websites/1id.com/` in the private 1id project repository.
@@ -36,5 +36,5 @@ make github-site     # sync 1id.com only
 |-------------|--------------|------------------|
 | `1id-com/oneid-sdk` | `sdk/oneid-sdk/` | Python SDK (PyPI: `oneid-sdk`) |
 | `1id-com/oneid-enroll` | `sdk/oneid-enroll/` | Go binary for TPM/HSM operations |
-| `1id-com/oneid-node` | *(future)* | Node.js SDK |
-| `1id-com/1id.com` | `public_html/`, `api/`, `keycloak-spi/`, `config/` | Website + API + Keycloak SPI |
+| `1id-com/oneid-node` | `sdk/oneid-node/` | Node.js SDK (npm: `1id`) |
+| *(omitted)* | `public_html/`, `api/`, `keycloak-spi/`, `config/` | Website + API + Keycloak SPI (not mirrored) |
