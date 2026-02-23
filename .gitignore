@@ -3,3 +3,6 @@ dist/
 *.tgz
 .npmrc
 tracker.log
+
+# Makefile sync marker (not part of the source)
+DANGER-IMPORTANT-READ-FIRST.md
