@@ -60,7 +60,7 @@ export enum HSMType {
 export interface Identity {
   /** Permanent unique identifier (e.g., '1id-a7b3c9d2'). Never changes. */
   readonly internal_id: string;
-  /** Display name (e.g., '@clawdia' or '@1id-a7b3c9d2'). */
+  /** Handle (e.g., '@clawdia' or '@1id-a7b3c9d2'). */
   readonly handle: string;
   /** The trust level assigned based on hardware attestation. */
   readonly trust_tier: TrustTier;
@@ -74,6 +74,8 @@ export interface Identity {
   readonly device_count: number;
   /** The key algorithm used for this identity's signing key. */
   readonly key_algorithm: KeyAlgorithm;
+  /** Friendly name chosen by the agent (e.g., "Clawdia", "Sparky"). */
+  readonly display_name: string | null;
 }
 
 /**
@@ -116,5 +118,6 @@ export function format_authorization_header_value(token: Token): string {
  * Format an Identity as a human-readable string.
  */
 export function format_identity_as_display_string(identity: Identity): string {
-  return `${identity.handle} (tier: ${identity.trust_tier}, id: ${identity.internal_id})`;
+  const name_part = identity.display_name ? ` (${identity.display_name})` : "";
+  return `${identity.handle}${name_part} (tier: ${identity.trust_tier}, id: ${identity.internal_id})`;
 }

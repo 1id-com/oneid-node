@@ -1,28 +1,20 @@
 /**
  * 1id.com SDK -- Hardware-anchored identity for AI agents.
  *
- * Quick start:
+ * Quick start (recommended):
  *
  *     import oneid from "1id";
  *
- *     // Enroll at declared tier (no HSM, always works)
- *     const identity = await oneid.enroll({ request_tier: "declared" });
- *     console.log(`Enrolled as ${identity.handle}`);
+ *     // Get or create your identity -- the simplest path
+ *     const identity = await oneid.getOrCreateIdentity({ display_name: "Sparky" });
+ *     console.log(`I am ${oneid.format_identity_as_display_string(identity)}`);
  *
- *     // Get an OAuth2 token for authentication
+ *     // Get an OAuth2 Bearer token for API calls
  *     const token = await oneid.getToken();
- *     console.log(`Bearer ${token.access_token}`);
+ *     // Use token.access_token in Authorization headers
  *
- *     // Check current identity
- *     const me = oneid.whoami();
- *
- * Trust tiers (request_tier parameter):
- *     'sovereign'          -- TPM hardware, manufacturer-attested
- *     'sovereign-portable' -- YubiKey/Nitrokey, manufacturer-attested
- *     'declared'           -- Software keys, no hardware proof
- *
- * CRITICAL: request_tier is a REQUIREMENT, not a preference.
- * You get exactly what you ask for, or an exception. No fallbacks.
+ * The SDK auto-detects your hardware (TPM, YubiKey, Secure Enclave)
+ * and enrolls at the highest available trust tier.
  */
 
 import { clear_cached_token, get_token, authenticate_with_tpm } from "./auth.js";
@@ -71,17 +63,6 @@ export {
   this_token_has_not_yet_expired,
   format_authorization_header_value,
   format_identity_as_display_string,
-};
-
-// Re-export core functions
-export {
-  enroll,
-  get_token as getToken,
-  get_token,
-  clear_cached_token,
-  authenticate_with_tpm,
-  credentials_exist,
-  sign_challenge_with_private_key,
 };
 
 /** SDK version string. */
@@ -144,7 +125,38 @@ export function whoami(): Identity {
     enrolled_at,
     device_count: creds.hsm_key_reference ? 1 : 0,
     key_algorithm,
+    display_name: creds.display_name ?? null,
   };
+}
+
+export interface GetOrCreateIdentityOptions {
+  display_name?: string | null;
+  operator_email?: string | null;
+  requested_handle?: string | null;
+  api_base_url?: string;
+}
+
+/**
+ * Get your existing 1ID identity, or create one if you don't have one yet.
+ *
+ * This is the simplest way to ensure you have a working identity:
+ *   const id = await oneid.getOrCreateIdentity({ display_name: "Sparky" });
+ *
+ * If you've already enrolled, returns your existing identity instantly
+ * (no network call). If not, enrolls at the best available trust tier.
+ */
+export async function getOrCreateIdentity(
+  options?: GetOrCreateIdentityOptions
+): Promise<Identity> {
+  if (credentials_exist()) {
+    return whoami();
+  }
+  return enroll({
+    display_name: options?.display_name ?? null,
+    operator_email: options?.operator_email ?? null,
+    requested_handle: options?.requested_handle ?? null,
+    api_base_url: options?.api_base_url,
+  });
 }
 
 /**
@@ -157,9 +169,20 @@ export function refresh(): void {
   clear_cached_token();
 }
 
-// -- Default export for convenience --
+// Re-export core functions
+export {
+  enroll,
+  get_token as getToken,
+  get_token,
+  clear_cached_token,
+  authenticate_with_tpm,
+  credentials_exist,
+  sign_challenge_with_private_key,
+};
+
 const oneid = {
   enroll,
+  getOrCreateIdentity,
   getToken: get_token,
   get_token,
   whoami,
@@ -168,6 +191,7 @@ const oneid = {
   authenticate_with_tpm,
   sign_challenge_with_private_key,
   clear_cached_token,
+  format_identity_as_display_string,
   VERSION,
   TrustTier,
   KeyAlgorithm,

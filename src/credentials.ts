@@ -53,6 +53,8 @@ export interface StoredCredentials {
   hsm_key_reference?: string | null;
   /** ISO 8601 timestamp of enrollment. */
   enrolled_at?: string | null;
+  /** Friendly name chosen by the agent (e.g., "Clawdia", "Sparky"). */
+  display_name?: string | null;
 }
 
 /**
@@ -131,6 +133,9 @@ export function save_credentials(credentials: StoredCredentials): string {
   if (credentials.hsm_key_reference != null) {
     credentials_dict["hsm_key_reference"] = credentials.hsm_key_reference;
   }
+  if (credentials.display_name != null) {
+    credentials_dict["display_name"] = credentials.display_name;
+  }
 
   fs.writeFileSync(credentials_file_path, JSON.stringify(credentials_dict, null, 2) + "\n", "utf-8");
   set_owner_only_permissions(credentials_file_path);
@@ -177,6 +182,7 @@ export function load_credentials(): StoredCredentials {
     private_key_pem: (credentials_dict["private_key_pem"] as string) ?? null,
     hsm_key_reference: (credentials_dict["hsm_key_reference"] as string) ?? null,
     enrolled_at: (credentials_dict["enrolled_at"] as string) ?? null,
+    display_name: (credentials_dict["display_name"] as string) ?? null,
   };
 }
 

@@ -6,9 +6,12 @@
  * - Sovereign: Spawns Go binary for TPM operations, two-phase enrollment.
  * - Sovereign-portable: Spawns Go binary for YubiKey/PIV operations.
  *
- * CRITICAL DESIGN RULE: requestTier is a REQUIREMENT, not a preference.
- * The agent gets exactly the tier it requests, or an exception.
- * There are NO automatic fallbacks. The caller's logic decides what to do.
+ * When request_tier is omitted, the SDK auto-detects the best available
+ * hardware and enrolls at the highest trust tier the machine supports,
+ * falling back gracefully to declared tier (software keys).
+ *
+ * When request_tier is specified, the agent gets exactly that tier or
+ * an exception -- no automatic fallbacks.
  */
 
 import { OneIDAPIClient } from "./client.js";
@@ -45,12 +48,30 @@ const TIER_TO_HSM_TYPE_PREFERENCES: Readonly<Record<string, string[]>> = {
   [TrustTier.ENCLAVE]: ["secure_enclave"],
 };
 
+const AUTO_DETECT_TIER_PREFERENCE_ORDER: TrustTier[] = [
+  TrustTier.SOVEREIGN,
+  TrustTier.SOVEREIGN_PORTABLE,
+  TrustTier.ENCLAVE,
+  TrustTier.VIRTUAL,
+  TrustTier.DECLARED,
+];
+
 /**
  * Options for the enroll() function.
  */
 export interface EnrollOptions {
-  /** REQUIRED. The trust tier to request. */
-  request_tier: string;
+  /**
+   * Optional. The trust tier to request. If omitted, the SDK auto-detects
+   * the best available hardware and enrolls at the highest possible tier.
+   */
+  request_tier?: string | null;
+  /**
+   * Optional. A friendly name for your agent. Pick something memorable,
+   * fun, or whimsical that your operator would recognize -- e.g.,
+   * "Clawdia", "Sparky", "Nightowl". A good name makes your operator
+   * proud and more likely to talk about you.
+   */
+  display_name?: string | null;
   /** Optional. Human contact email for this agent. */
   operator_email?: string | null;
   /** Optional. Vanity handle to claim (without '@' prefix). */
@@ -64,70 +85,113 @@ export interface EnrollOptions {
 /**
  * Enroll this agent with 1id.com to receive a unique, verifiable identity.
  *
- * This is the primary entry point for enrollment. The agent specifies
- * which trust tier it requires, and gets exactly that tier or an exception.
+ * The simplest call is just oneid.enroll({}) or oneid.enroll() -- the SDK
+ * auto-detects the best available hardware and enrolls at the highest
+ * trust tier your machine supports.
  *
- * THERE ARE NO AUTOMATIC FALLBACKS.
- *
- * @param options Enrollment options including the required request_tier.
- * @returns The enrolled Identity.
- * @throws NoHSMError if requested tier requires an HSM but none was found.
- * @throws EnrollmentError for any enrollment failure.
- * @throws NetworkError if the server cannot be reached.
+ * If request_tier is specified, you get exactly that tier or an exception.
  */
-export async function enroll(options: EnrollOptions): Promise<Identity> {
-  // Validate and normalize the requested tier
-  const valid_tiers = Object.values(TrustTier) as string[];
-  if (!valid_tiers.includes(options.request_tier)) {
-    throw new EnrollmentError(
-      `Invalid trust tier: '${options.request_tier}'. Valid tiers: ${valid_tiers.join(", ")}`
-    );
-  }
-  const tier = options.request_tier as TrustTier;
+export async function enroll(options?: EnrollOptions): Promise<Identity> {
+  const effective_options = options ?? {};
+  const api_base_url = effective_options.api_base_url ?? DEFAULT_API_BASE_URL;
+  const display_name = effective_options.display_name ?? null;
 
   // Normalize key algorithm
   let resolved_key_algorithm: KeyAlgorithm;
-  if (options.key_algorithm == null) {
+  if (effective_options.key_algorithm == null) {
     resolved_key_algorithm = DEFAULT_KEY_ALGORITHM;
-  } else if (typeof options.key_algorithm === "string") {
+  } else if (typeof effective_options.key_algorithm === "string") {
     const valid_algorithms = Object.values(KeyAlgorithm) as string[];
-    if (!valid_algorithms.includes(options.key_algorithm)) {
+    if (!valid_algorithms.includes(effective_options.key_algorithm)) {
       throw new EnrollmentError(
-        `Invalid key algorithm: '${options.key_algorithm}'. Valid: ${valid_algorithms.join(", ")}`
+        `Invalid key algorithm: '${effective_options.key_algorithm}'. Valid: ${valid_algorithms.join(", ")}`
       );
     }
-    resolved_key_algorithm = options.key_algorithm as KeyAlgorithm;
+    resolved_key_algorithm = effective_options.key_algorithm as KeyAlgorithm;
   } else {
-    resolved_key_algorithm = options.key_algorithm;
+    resolved_key_algorithm = effective_options.key_algorithm;
   }
 
-  const api_base_url = options.api_base_url ?? DEFAULT_API_BASE_URL;
-
-  // Route to the appropriate enrollment flow
-  if (tier === TrustTier.DECLARED) {
-    return enroll_declared_tier(
-      options.operator_email ?? null,
-      options.requested_handle ?? null,
+  if (effective_options.request_tier == null) {
+    return enroll_with_auto_detected_best_tier(
+      display_name,
+      effective_options.operator_email ?? null,
+      effective_options.requested_handle ?? null,
       resolved_key_algorithm,
       api_base_url,
     );
+  }
+
+  const valid_tiers = Object.values(TrustTier) as string[];
+  if (!valid_tiers.includes(effective_options.request_tier)) {
+    throw new EnrollmentError(
+      `Invalid trust tier: '${effective_options.request_tier}'. Valid tiers: ${valid_tiers.join(", ")}`
+    );
+  }
+  const tier = effective_options.request_tier as TrustTier;
+
+  return enroll_at_specific_tier(
+    tier,
+    display_name,
+    effective_options.operator_email ?? null,
+    effective_options.requested_handle ?? null,
+    resolved_key_algorithm,
+    api_base_url,
+  );
+}
+
+async function enroll_at_specific_tier(
+  tier: TrustTier,
+  display_name: string | null,
+  operator_email: string | null,
+  requested_handle: string | null,
+  key_algorithm: KeyAlgorithm,
+  api_base_url: string,
+): Promise<Identity> {
+  if (tier === TrustTier.DECLARED) {
+    return enroll_declared_tier(operator_email, requested_handle, display_name, key_algorithm, api_base_url);
   } else if (tier === TrustTier.SOVEREIGN_PORTABLE) {
-    return enroll_piv_tier(
-      tier,
-      options.operator_email ?? null,
-      options.requested_handle ?? null,
-      api_base_url,
-    );
+    return enroll_piv_tier(tier, operator_email, requested_handle, display_name, api_base_url);
   } else if (TIERS_REQUIRING_HSM.has(tier)) {
-    return enroll_hsm_tier(
-      tier,
-      options.operator_email ?? null,
-      options.requested_handle ?? null,
-      api_base_url,
-    );
+    return enroll_hsm_tier(tier, operator_email, requested_handle, display_name, api_base_url);
   } else {
     throw new EnrollmentError(`Tier '${tier}' is not yet implemented`);
   }
+}
+
+async function enroll_with_auto_detected_best_tier(
+  display_name: string | null,
+  operator_email: string | null,
+  requested_handle: string | null,
+  key_algorithm: KeyAlgorithm,
+  api_base_url: string,
+): Promise<Identity> {
+  console.log("[oneid] Auto-detecting best available trust tier...");
+
+  for (const candidate_tier of AUTO_DETECT_TIER_PREFERENCE_ORDER) {
+    try {
+      console.log(`[oneid] Trying tier: ${candidate_tier}`);
+      const identity = await enroll_at_specific_tier(
+        candidate_tier, display_name, operator_email, requested_handle,
+        key_algorithm, api_base_url,
+      );
+      console.log(`[oneid] Enrolled at ${candidate_tier} tier (auto-detected)`);
+      return identity;
+    } catch (error) {
+      if (error instanceof NoHSMError) {
+        console.log(`[oneid] Tier ${candidate_tier} not available (no compatible hardware), trying next...`);
+        continue;
+      }
+      if (candidate_tier === TrustTier.DECLARED) { throw error; }
+      console.log(`[oneid] Tier ${candidate_tier} failed, trying next...`);
+      continue;
+    }
+  }
+
+  throw new EnrollmentError(
+    "Auto-detection failed: could not enroll at any tier. " +
+    "This should not happen because declared tier requires no hardware."
+  );
 }
 
 /**
@@ -136,6 +200,7 @@ export async function enroll(options: EnrollOptions): Promise<Identity> {
 async function enroll_declared_tier(
   operator_email: string | null,
   requested_handle: string | null,
+  display_name: string | null,
   key_algorithm: KeyAlgorithm,
   api_base_url: string,
 ): Promise<Identity> {
@@ -170,11 +235,11 @@ async function enroll_declared_tier(
     key_algorithm,
     private_key_pem,
     enrolled_at: enrolled_at_str,
+    display_name,
   };
   const credentials_file_path = save_credentials(stored_credentials);
   console.log(`[oneid] Credentials saved to ${credentials_file_path}`);
 
-  // Step 5: Return Identity object
   let enrolled_at: Date;
   try {
     enrolled_at = new Date(enrolled_at_str);
@@ -191,6 +256,7 @@ async function enroll_declared_tier(
     enrolled_at,
     device_count: 0,
     key_algorithm,
+    display_name,
   };
 }
 
@@ -211,6 +277,7 @@ async function enroll_piv_tier(
   request_tier: TrustTier,
   operator_email: string | null,
   requested_handle: string | null,
+  display_name: string | null,
   api_base_url: string,
 ): Promise<Identity> {
   const {
@@ -275,6 +342,7 @@ async function enroll_piv_tier(
     key_algorithm: "ecdsa-p256",
     hsm_key_reference: "piv-slot-9a",
     enrolled_at: enrolled_at_str,
+    display_name,
   };
   save_credentials(stored_credentials);
 
@@ -311,16 +379,15 @@ async function enroll_piv_tier(
     enrolled_at,
     device_count: (identity_data.device_count as number) ?? 1,
     key_algorithm: KeyAlgorithm.ECDSA_P256,
+    display_name,
   };
 }
 
-/**
- * Enroll at an HSM-backed trust tier (sovereign, sovereign-portable, etc.).
- */
 async function enroll_hsm_tier(
   request_tier: TrustTier,
   operator_email: string | null,
   requested_handle: string | null,
+  display_name: string | null,
   api_base_url: string,
 ): Promise<Identity> {
   const {
@@ -397,6 +464,7 @@ async function enroll_hsm_tier(
     key_algorithm: "tpm-ak",
     hsm_key_reference: (attestation_data.ak_handle as string) ?? null,
     enrolled_at: enrolled_at_str,
+    display_name,
   };
   save_credentials(stored_credentials);
 
@@ -407,7 +475,6 @@ async function enroll_hsm_tier(
     enrolled_at = new Date();
   }
 
-  // Resolve trust tier enum
   let trust_tier: TrustTier;
   const valid_tiers = Object.values(TrustTier) as string[];
   if (valid_tiers.includes(trust_tier_str)) {
@@ -416,7 +483,6 @@ async function enroll_hsm_tier(
     trust_tier = request_tier;
   }
 
-  // Resolve HSM type enum
   let hsm_type: HSMType;
   const hsm_type_str = (selected_hsm.type as string) ?? "tpm";
   const valid_hsm_types = Object.values(HSMType) as string[];
@@ -435,6 +501,7 @@ async function enroll_hsm_tier(
     enrolled_at,
     device_count: (identity_data.device_count as number) ?? 1,
     key_algorithm: KeyAlgorithm.RSA_2048,
+    display_name,
   };
 }
 
