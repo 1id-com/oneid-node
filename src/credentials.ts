@@ -55,6 +55,12 @@ export interface StoredCredentials {
   enrolled_at?: string | null;
   /** Friendly name chosen by the agent (e.g., "Clawdia", "Sparky"). */
   display_name?: string | null;
+  /** Agent Identity URN (e.g., 'urn:aid:1id.com:1id-a7b3c9d2'), or null if not yet assigned. */
+  agent_identity_urn?: string | null;
+  /** ISO 8601 timestamp of when the user consented to privacy implications. */
+  privacy_consent_given_at?: string | null;
+  /** The user's chosen default attestation mode: 'sd-jwt' or 'direct'. */
+  default_attestation_mode?: string | null;
 }
 
 /**
@@ -136,6 +142,15 @@ export function save_credentials(credentials: StoredCredentials): string {
   if (credentials.display_name != null) {
     credentials_dict["display_name"] = credentials.display_name;
   }
+  if (credentials.agent_identity_urn != null) {
+    credentials_dict["agent_identity_urn"] = credentials.agent_identity_urn;
+  }
+  if (credentials.privacy_consent_given_at != null) {
+    credentials_dict["privacy_consent_given_at"] = credentials.privacy_consent_given_at;
+  }
+  if (credentials.default_attestation_mode != null) {
+    credentials_dict["default_attestation_mode"] = credentials.default_attestation_mode;
+  }
 
   fs.writeFileSync(credentials_file_path, JSON.stringify(credentials_dict, null, 2) + "\n", "utf-8");
   set_owner_only_permissions(credentials_file_path);
@@ -183,6 +198,9 @@ export function load_credentials(): StoredCredentials {
     hsm_key_reference: (credentials_dict["hsm_key_reference"] as string) ?? null,
     enrolled_at: (credentials_dict["enrolled_at"] as string) ?? null,
     display_name: (credentials_dict["display_name"] as string) ?? null,
+    agent_identity_urn: (credentials_dict["agent_identity_urn"] as string) ?? null,
+    privacy_consent_given_at: (credentials_dict["privacy_consent_given_at"] as string) ?? null,
+    default_attestation_mode: (credentials_dict["default_attestation_mode"] as string) ?? null,
   };
 }
 

@@ -8,20 +8,18 @@
 /**
  * Trust tiers assigned by 1id.com based on hardware attestation.
  *
+ * RFC: draft-drake-email-hardware-attestation-00 Section 3.
+ *
  * Ordered from highest to lowest Sybil resistance:
- * - sovereign: Non-portable hardware (TPM), manufacturer-attested, current cert
- * - sovereign-portable: Portable hardware (YubiKey/Nitrokey), manufacturer-attested
- * - legacy: Was sovereign/sovereign-portable, but manufacturer cert expired
- * - virtual: Virtual TPM (VMware/Hyper-V), hypervisor-attested
- * - enclave: Apple Secure Enclave, TOFU (no attestation PKI)
- * - declared: Software-only, no hardware proof, self-asserted
+ * - sovereign (TPM): Non-portable discrete/firmware TPM, manufacturer CA chain verifiable
+ * - portable  (PIV): Portable PIV device (YubiKey/Nitrokey/Feitian), manufacturer-attested
+ * - virtual   (VRT): Hypervisor vTPM (VMware/Hyper-V/QEMU), hypervisor-attested
+ * - declared  (SFT): Software-only, no hardware proof, works everywhere
  */
 export enum TrustTier {
   SOVEREIGN = "sovereign",
-  SOVEREIGN_PORTABLE = "sovereign-portable",
-  LEGACY = "legacy",
+  PORTABLE = "portable",
   VIRTUAL = "virtual",
-  ENCLAVE = "enclave",
   DECLARED = "declared",
 }
 
@@ -74,6 +72,8 @@ export interface Identity {
   readonly device_count: number;
   /** The key algorithm used for this identity's signing key. */
   readonly key_algorithm: KeyAlgorithm;
+  /** Agent Identity URN (e.g., 'urn:aid:1id.com:1id-a7b3c9d2'), or null if not yet assigned. */
+  readonly agent_identity_urn: string | null;
   /** Friendly name chosen by the agent (e.g., "Clawdia", "Sparky"). */
   readonly display_name: string | null;
 }
@@ -119,5 +119,6 @@ export function format_authorization_header_value(token: Token): string {
  */
 export function format_identity_as_display_string(identity: Identity): string {
   const name_part = identity.display_name ? ` (${identity.display_name})` : "";
-  return `${identity.handle}${name_part} (tier: ${identity.trust_tier}, id: ${identity.internal_id})`;
+  const urn_part = identity.agent_identity_urn ? `, urn: ${identity.agent_identity_urn}` : "";
+  return `${identity.handle}${name_part} (tier: ${identity.trust_tier}, id: ${identity.internal_id}${urn_part})`;
 }

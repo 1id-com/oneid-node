@@ -18,7 +18,7 @@
  */
 
 import { clear_cached_token, get_token, authenticate_with_tpm } from "./auth.js";
-import { credentials_exist, load_credentials } from "./credentials.js";
+import { credentials_exist, load_credentials, save_credentials } from "./credentials.js";
 import { enroll, type EnrollOptions } from "./enroll.js";
 import { sign_challenge_with_private_key } from "./keys.js";
 import {
@@ -40,6 +40,7 @@ export {
   NoHSMError,
   UACDeniedError,
   HSMAccessError,
+  TPMSetupRequiredError,
   AlreadyEnrolledError,
   HandleTakenError,
   HandleInvalidError,
@@ -66,7 +67,7 @@ export {
 };
 
 /** SDK version string. */
-export const VERSION = "0.1.0";
+export const VERSION = "0.5.0";
 
 /**
  * Check the current enrolled identity.
@@ -125,6 +126,7 @@ export function whoami(): Identity {
     enrolled_at,
     device_count: creds.hsm_key_reference ? 1 : 0,
     key_algorithm,
+    agent_identity_urn: creds.agent_identity_urn ?? null,
     display_name: creds.display_name ?? null,
   };
 }
@@ -169,6 +171,46 @@ export function refresh(): void {
   clear_cached_token();
 }
 
+/**
+ * One-time setup: grant TBS access to non-admin users (Windows only).
+ *
+ * Sets a Windows registry key so that all future TPM operations work
+ * without administrator privileges. Triggers a UAC prompt on Windows.
+ * No-op on other platforms.
+ *
+ * Call this when you catch TPMSetupRequiredError during enrollment.
+ *
+ * @returns True if setup succeeded (or was already done).
+ * @throws UACDeniedError if the user denied the UAC prompt.
+ * @throws HSMAccessError if the registry key could not be set.
+ */
+export async function setup_tbs(): Promise<boolean> {
+  const { setup_tbs_for_non_admin_tpm_access } = await import("./helper.js");
+  const result = await setup_tbs_for_non_admin_tpm_access();
+  return (result.ok as boolean) ?? false;
+}
+
+/**
+ * Record the user's privacy consent choice in the credentials file.
+ *
+ * After the calling application shows a privacy warning and the user
+ * consents, call this to persist their preferred attestation mode.
+ *
+ * @param mode The user's chosen attestation mode: 'sd-jwt' or 'direct'.
+ * @throws NotEnrolledError if no credentials file exists yet.
+ * @throws Error if mode is not 'sd-jwt' or 'direct'.
+ */
+export function record_privacy_consent(mode: string = "sd-jwt"): void {
+  if (mode !== "sd-jwt" && mode !== "direct") {
+    throw new Error(`Invalid attestation mode '${mode}'. Must be 'sd-jwt' or 'direct'.`);
+  }
+
+  const creds = load_credentials();
+  creds.privacy_consent_given_at = new Date().toISOString();
+  creds.default_attestation_mode = mode;
+  save_credentials(creds);
+}
+
 // Re-export core functions
 export {
   enroll,
@@ -187,6 +229,8 @@ const oneid = {
   get_token,
   whoami,
   refresh,
+  setup_tbs,
+  record_privacy_consent,
   credentials_exist,
   authenticate_with_tpm,
   sign_challenge_with_private_key,

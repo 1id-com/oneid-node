@@ -211,15 +211,13 @@ describe("Exception hierarchy (offline)", () => {
 
 describe("SDK version and types (offline)", () => {
   it("should report correct SDK version", () => {
-    assert.equal(VERSION, "0.1.0");
+    assert.equal(VERSION, "0.5.0");
   });
 
   it("should have all trust tiers", () => {
     assert.equal(TrustTier.SOVEREIGN, "sovereign");
-    assert.equal(TrustTier.SOVEREIGN_PORTABLE, "sovereign-portable");
-    assert.equal(TrustTier.LEGACY, "legacy");
+    assert.equal(TrustTier.PORTABLE, "portable");
     assert.equal(TrustTier.VIRTUAL, "virtual");
-    assert.equal(TrustTier.ENCLAVE, "enclave");
     assert.equal(TrustTier.DECLARED, "declared");
   });
 

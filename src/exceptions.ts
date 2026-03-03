@@ -74,6 +74,23 @@ export class HSMAccessError extends EnrollmentError {
 }
 
 /**
+ * TPM is present but TBS (TPM Base Services) access is not configured.
+ *
+ * On Windows, non-admin users cannot access the TPM unless a one-time
+ * registry key is set. This exception signals that the calling application
+ * should display a privacy warning, call oneid.setup_tbs() if the user
+ * consents, call oneid.record_privacy_consent(), and retry enrollment.
+ *
+ * Distinct from NoHSMError (no TPM) and HSMAccessError (TPM broken/locked).
+ */
+export class TPMSetupRequiredError extends EnrollmentError {
+  constructor(message: string = "TPM found but TBS access requires one-time setup") {
+    super(message, "TBS_ACCESS_DENIED");
+    this.name = "TPMSetupRequiredError";
+  }
+}
+
+/**
  * This HSM is already enrolled with a different identity.
  */
 export class AlreadyEnrolledError extends EnrollmentError {

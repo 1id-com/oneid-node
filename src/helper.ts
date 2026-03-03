@@ -25,6 +25,7 @@ import {
   BinaryNotFoundError,
   HSMAccessError,
   NoHSMError,
+  TPMSetupRequiredError,
   UACDeniedError,
 } from "./exceptions.js";
 
@@ -142,7 +143,7 @@ function download_file_to_path(url: string, destination: string, max_redirects: 
     }
 
     const transport = url.startsWith("https:") ? https : http;
-    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.3.0" } }, (res) => {
+    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.5.0" } }, (res) => {
       // Handle redirects (GitHub releases redirect to S3)
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         download_file_to_path(res.headers.location, destination, max_redirects - 1)
@@ -184,7 +185,7 @@ function download_text_from_url(url: string, max_redirects: number = 5): Promise
     }
 
     const transport = url.startsWith("https:") ? https : http;
-    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.3.0" } }, (res) => {
+    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.5.0" } }, (res) => {
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         download_text_from_url(res.headers.location, max_redirects - 1)
           .then(resolve)
@@ -365,7 +366,9 @@ export async function run_binary_command(
         const error_code = (output.error_code as string) ?? "UNKNOWN";
         const error_message = (output.error as string) ?? (stderr_data.trim() || `Exit code ${exit_code}`);
 
-        if (error_code === "NO_HSM_FOUND" || /no.*hsm/i.test(error_message) || /no.*tpm/i.test(error_message)) {
+        if (error_code === "TBS_ACCESS_DENIED" || error_code === "TBS_ACCESS_NOT_CONFIGURED") {
+          reject(new TPMSetupRequiredError(error_message));
+        } else if (error_code === "NO_HSM_FOUND" || /no.*hsm/i.test(error_message) || /no.*tpm/i.test(error_message)) {
           reject(new NoHSMError(error_message));
         } else if (error_code === "UAC_DENIED" || /denied/i.test(error_message)) {
           reject(new UACDeniedError(error_message));
@@ -424,6 +427,21 @@ export async function activate_credential(
     "--elevated",
   ]);
   return (output.decrypted_credential as string) ?? "";
+}
+
+/**
+ * Run the one-time TBS access setup via the Go binary.
+ *
+ * Calls 'oneid-enroll setup-tbs --elevated --json' which sets a Windows
+ * registry key to allow non-admin users to access TPM Base Services.
+ * Triggers a UAC prompt on Windows. No-op on other platforms.
+ *
+ * @returns Object with ok, already_set, and optionally platform fields.
+ * @throws UACDeniedError if the user denied the UAC prompt.
+ * @throws HSMAccessError if the registry key could not be set.
+ */
+export async function setup_tbs_for_non_admin_tpm_access(): Promise<Record<string, unknown>> {
+  return run_binary_command("setup-tbs", ["--elevated"]);
 }
 
 /**

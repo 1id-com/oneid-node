@@ -1,10 +1,12 @@
 /**
  * Enrollment logic for the 1id.com Node.js SDK.
  *
- * Orchestrates the enrollment flow for all trust tiers:
- * - Declared: Pure software, generates a keypair, sends public key to server.
+ * Orchestrates the enrollment flow for all trust tiers
+ * (RFC: draft-drake-email-hardware-attestation-00 Section 3):
+ * - Declared:  Pure software, generates a keypair, sends public key to server.
  * - Sovereign: Spawns Go binary for TPM operations, two-phase enrollment.
- * - Sovereign-portable: Spawns Go binary for YubiKey/PIV operations.
+ * - Portable:  Spawns Go binary for YubiKey/PIV operations.
+ * - Virtual:   Spawns Go binary for vTPM operations.
  *
  * When request_tier is omitted, the SDK auto-detects the best available
  * hardware and enrolls at the highest trust tier the machine supports,
@@ -33,25 +35,20 @@ import { generate_keypair } from "./keys.js";
 /** Trust tiers that require an HSM and the Go binary. */
 const TIERS_REQUIRING_HSM: ReadonlySet<TrustTier> = new Set([
   TrustTier.SOVEREIGN,
-  TrustTier.SOVEREIGN_PORTABLE,
-  TrustTier.LEGACY,
+  TrustTier.PORTABLE,
   TrustTier.VIRTUAL,
-  TrustTier.ENCLAVE,
 ]);
 
 /** HSM type preferences by tier. */
 const TIER_TO_HSM_TYPE_PREFERENCES: Readonly<Record<string, string[]>> = {
   [TrustTier.SOVEREIGN]: ["tpm"],
-  [TrustTier.SOVEREIGN_PORTABLE]: ["yubikey", "nitrokey", "feitian", "solokeys"],
-  [TrustTier.LEGACY]: ["tpm", "yubikey", "nitrokey", "feitian"],
+  [TrustTier.PORTABLE]: ["yubikey", "nitrokey", "feitian", "solokeys"],
   [TrustTier.VIRTUAL]: ["tpm"],
-  [TrustTier.ENCLAVE]: ["secure_enclave"],
 };
 
 const AUTO_DETECT_TIER_PREFERENCE_ORDER: TrustTier[] = [
   TrustTier.SOVEREIGN,
-  TrustTier.SOVEREIGN_PORTABLE,
-  TrustTier.ENCLAVE,
+  TrustTier.PORTABLE,
   TrustTier.VIRTUAL,
   TrustTier.DECLARED,
 ];
@@ -150,7 +147,7 @@ async function enroll_at_specific_tier(
 ): Promise<Identity> {
   if (tier === TrustTier.DECLARED) {
     return enroll_declared_tier(operator_email, requested_handle, display_name, key_algorithm, api_base_url);
-  } else if (tier === TrustTier.SOVEREIGN_PORTABLE) {
+  } else if (tier === TrustTier.PORTABLE) {
     return enroll_piv_tier(tier, operator_email, requested_handle, display_name, api_base_url);
   } else if (TIERS_REQUIRING_HSM.has(tier)) {
     return enroll_hsm_tier(tier, operator_email, requested_handle, display_name, api_base_url);
@@ -220,7 +217,8 @@ async function enroll_declared_tier(
   const identity_data = (server_response.identity ?? {}) as Record<string, unknown>;
   const credentials_data = (server_response.credentials ?? {}) as Record<string, unknown>;
 
-  const internal_id = (identity_data.internal_id as string) ?? "";
+  const internal_id = (identity_data.agent_id as string) ?? (identity_data.internal_id as string) ?? "";
+  const agent_identity_urn = (identity_data.agent_identity_urn as string) ?? "";
   const handle = (identity_data.handle as string) ?? `@${internal_id.slice(0, 12)}`;
   const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
 
@@ -236,6 +234,7 @@ async function enroll_declared_tier(
     private_key_pem,
     enrolled_at: enrolled_at_str,
     display_name,
+    agent_identity_urn: agent_identity_urn || null,
   };
   const credentials_file_path = save_credentials(stored_credentials);
   console.log(`[oneid] Credentials saved to ${credentials_file_path}`);
@@ -256,12 +255,13 @@ async function enroll_declared_tier(
     enrolled_at,
     device_count: 0,
     key_algorithm,
+    agent_identity_urn: agent_identity_urn || null,
     display_name,
   };
 }
 
 /**
- * Enroll at the sovereign-portable tier using a PIV device (YubiKey).
+ * Enroll at the portable tier using a PIV device (YubiKey/Nitrokey/Feitian).
  *
  * This uses the Go binary (oneid-enroll) to:
  * 1. Detect available HSMs and select a PIV device
@@ -327,7 +327,8 @@ async function enroll_piv_tier(
   const identity_data = (activate_response.identity ?? {}) as Record<string, unknown>;
   const credentials_data = (activate_response.credentials ?? {}) as Record<string, unknown>;
 
-  const internal_id = (identity_data.internal_id as string) ?? "";
+  const internal_id = (identity_data.agent_id as string) ?? (identity_data.internal_id as string) ?? "";
+  const agent_identity_urn = (identity_data.agent_identity_urn as string) ?? "";
   const handle = (identity_data.handle as string) ?? `@${internal_id.slice(0, 12)}`;
   const trust_tier_str = (identity_data.trust_tier as string) ?? request_tier;
   const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
@@ -343,6 +344,7 @@ async function enroll_piv_tier(
     hsm_key_reference: "piv-slot-9a",
     enrolled_at: enrolled_at_str,
     display_name,
+    agent_identity_urn: agent_identity_urn || null,
   };
   save_credentials(stored_credentials);
 
@@ -379,6 +381,7 @@ async function enroll_piv_tier(
     enrolled_at,
     device_count: (identity_data.device_count as number) ?? 1,
     key_algorithm: KeyAlgorithm.ECDSA_P256,
+    agent_identity_urn: agent_identity_urn || null,
     display_name,
   };
 }
@@ -449,7 +452,8 @@ async function enroll_hsm_tier(
   const identity_data = (activate_response.identity ?? {}) as Record<string, unknown>;
   const credentials_data = (activate_response.credentials ?? {}) as Record<string, unknown>;
 
-  const internal_id = (identity_data.internal_id as string) ?? "";
+  const internal_id = (identity_data.agent_id as string) ?? (identity_data.internal_id as string) ?? "";
+  const agent_identity_urn = (identity_data.agent_identity_urn as string) ?? "";
   const handle = (identity_data.handle as string) ?? `@${internal_id.slice(0, 12)}`;
   const trust_tier_str = (identity_data.trust_tier as string) ?? request_tier;
   const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
@@ -465,6 +469,7 @@ async function enroll_hsm_tier(
     hsm_key_reference: (attestation_data.ak_handle as string) ?? null,
     enrolled_at: enrolled_at_str,
     display_name,
+    agent_identity_urn: agent_identity_urn || null,
   };
   save_credentials(stored_credentials);
 
@@ -501,6 +506,7 @@ async function enroll_hsm_tier(
     enrolled_at,
     device_count: (identity_data.device_count as number) ?? 1,
     key_algorithm: KeyAlgorithm.RSA_2048,
+    agent_identity_urn: agent_identity_urn || null,
     display_name,
   };
 }

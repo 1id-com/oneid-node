@@ -25,7 +25,7 @@ import {
 
 // -- HTTP client configuration --
 const DEFAULT_HTTP_TIMEOUT_MILLISECONDS = 30_000;
-const USER_AGENT = "oneid-sdk-node/0.3.0";
+const USER_AGENT = "oneid-sdk-node/0.5.0";
 
 interface RequestOptions {
   method: string;
@@ -171,7 +171,7 @@ export class OneIDAPIClient {
   }
 
   /**
-   * Begin TPM/HSM-based enrollment (sovereign/sovereign-portable tiers).
+   * Begin TPM/HSM-based enrollment (sovereign/virtual tiers).
    */
   async enroll_begin(
     ek_certificate_pem: string,
@@ -198,7 +198,7 @@ export class OneIDAPIClient {
   }
 
   /**
-   * Begin PIV-based enrollment (sovereign-portable tier).
+   * Begin PIV-based enrollment (portable tier).
    *
    * Sends the PIV attestation certificate, chain, and signing public key
    * to the PIV-specific server endpoint. The server validates the chain
