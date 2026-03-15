@@ -17,7 +17,7 @@
  * and enrolls at the highest available trust tier.
  */
 
-import { clear_cached_token, get_token, authenticate_with_tpm } from "./auth.js";
+import { clear_cached_token, get_token, authenticate_with_tpm, authenticate_with_piv } from "./auth.js";
 import { credentials_exist, load_credentials, save_credentials } from "./credentials.js";
 import { enroll, type EnrollOptions } from "./enroll.js";
 import { sign_challenge_with_private_key } from "./keys.js";
@@ -32,6 +32,35 @@ import {
   format_authorization_header_value,
   format_identity_as_display_string,
 } from "./identity.js";
+import {
+  fetch_world_status_from_server,
+  invalidate_world_cache,
+  type WorldStatus,
+  type WorldIdentitySection,
+  type WorldDeviceEntry,
+  type WorldServiceEntry,
+  type WorldGuidanceItem,
+  type WorldOperatorGuidance,
+} from "./world.js";
+import {
+  listDevices,
+  lockHardware,
+  registerOperatorEmail,
+  type DeviceInfo,
+  type DeviceListResult,
+  type HardwareLockResult,
+} from "./devices.js";
+import {
+  signChallenge,
+  verifyPeerIdentity,
+  PeerVerificationError,
+  CertificateChainValidationError,
+  SignatureVerificationError,
+  MissingIdentityCertificateError,
+  type IdentityProofBundle,
+  type VerifiedPeerIdentity,
+} from "./verify.js";
+import { refresh_trust_roots, get_trust_roots } from "./trustRoots.js";
 
 // Re-export all exception classes
 export {
@@ -46,6 +75,7 @@ export {
   HandleInvalidError,
   HandleRetiredError,
   AuthenticationError,
+  HardwareDeviceNotPresentError,
   NetworkError,
   NotEnrolledError,
   BinaryNotFoundError,
@@ -66,8 +96,40 @@ export {
   format_identity_as_display_string,
 };
 
+// Re-export world/status types
+export {
+  type WorldStatus,
+  type WorldIdentitySection,
+  type WorldDeviceEntry,
+  type WorldServiceEntry,
+  type WorldGuidanceItem,
+  type WorldOperatorGuidance,
+  invalidate_world_cache,
+};
+
+// Re-export device management types
+export {
+  type DeviceInfo,
+  type DeviceListResult,
+  type HardwareLockResult,
+};
+
+// Re-export peer verification types and functions
+export {
+  signChallenge,
+  verifyPeerIdentity,
+  refresh_trust_roots,
+  get_trust_roots,
+  PeerVerificationError,
+  CertificateChainValidationError,
+  SignatureVerificationError,
+  MissingIdentityCertificateError,
+  type IdentityProofBundle,
+  type VerifiedPeerIdentity,
+};
+
 /** SDK version string. */
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.1";
 
 /**
  * Check the current enrolled identity.
@@ -136,6 +198,7 @@ export interface GetOrCreateIdentityOptions {
   operator_email?: string | null;
   requested_handle?: string | null;
   api_base_url?: string;
+  get_only?: boolean;
 }
 
 /**
@@ -146,6 +209,12 @@ export interface GetOrCreateIdentityOptions {
  *
  * If you've already enrolled, returns your existing identity instantly
  * (no network call). If not, enrolls at the best available trust tier.
+ *
+ * Pass get_only: true when you want to recover context without risking
+ * a new enrollment. This is useful for agents resuming after a restart:
+ *   const id = await oneid.getOrCreateIdentity({ get_only: true });
+ *
+ * @throws NotEnrolledError if get_only is true and no credentials exist.
  */
 export async function getOrCreateIdentity(
   options?: GetOrCreateIdentityOptions
@@ -153,12 +222,41 @@ export async function getOrCreateIdentity(
   if (credentials_exist()) {
     return whoami();
   }
+
+  if (options?.get_only) {
+    const { NotEnrolledError: NotEnrolled } = await import("./exceptions.js");
+    throw new NotEnrolled(
+      "No 1ID identity found on this machine. " +
+      "You passed get_only: true, so no new enrollment was attempted. " +
+      "Call getOrCreateIdentity() without get_only to enroll, " +
+      "or call enroll() directly."
+    );
+  }
+
   return enroll({
     display_name: options?.display_name ?? null,
     operator_email: options?.operator_email ?? null,
     requested_handle: options?.requested_handle ?? null,
     api_base_url: options?.api_base_url,
   });
+}
+
+/**
+ * Get the full picture of your 1ID identity and connected services.
+ *
+ * Calls the server's world endpoint with your Bearer token and returns
+ * everything: identity, devices, connected services, available services,
+ * and operator guidance.
+ *
+ * Results are cached for 5 minutes. Call invalidate_world_cache() to force a fresh fetch.
+ *
+ * @returns WorldStatus with complete identity state.
+ * @throws NotEnrolledError if no credentials exist.
+ * @throws NetworkError if the server cannot be reached.
+ * @throws AuthenticationError if the token is invalid or expired.
+ */
+export async function status(): Promise<WorldStatus> {
+  return fetch_world_status_from_server();
 }
 
 /**
@@ -218,13 +316,18 @@ export {
   get_token,
   clear_cached_token,
   authenticate_with_tpm,
+  authenticate_with_piv,
   credentials_exist,
   sign_challenge_with_private_key,
+  listDevices,
+  lockHardware,
+  registerOperatorEmail,
 };
 
 const oneid = {
   enroll,
   getOrCreateIdentity,
+  status,
   getToken: get_token,
   get_token,
   whoami,
@@ -233,9 +336,18 @@ const oneid = {
   record_privacy_consent,
   credentials_exist,
   authenticate_with_tpm,
+  authenticate_with_piv,
   sign_challenge_with_private_key,
   clear_cached_token,
   format_identity_as_display_string,
+  invalidate_world_cache,
+  listDevices,
+  lockHardware,
+  registerOperatorEmail,
+  signChallenge,
+  verifyPeerIdentity,
+  refresh_trust_roots,
+  get_trust_roots,
   VERSION,
   TrustTier,
   KeyAlgorithm,

@@ -61,6 +61,8 @@ export interface StoredCredentials {
   privacy_consent_given_at?: string | null;
   /** The user's chosen default attestation mode: 'sd-jwt' or 'direct'. */
   default_attestation_mode?: string | null;
+  /** Full PEM-encoded certificate chain (leaf -> intermediate -> root) issued during enrollment. */
+  identity_certificate_chain_pem?: string | null;
 }
 
 /**
@@ -151,6 +153,9 @@ export function save_credentials(credentials: StoredCredentials): string {
   if (credentials.default_attestation_mode != null) {
     credentials_dict["default_attestation_mode"] = credentials.default_attestation_mode;
   }
+  if (credentials.identity_certificate_chain_pem != null) {
+    credentials_dict["identity_certificate_chain_pem"] = credentials.identity_certificate_chain_pem;
+  }
 
   fs.writeFileSync(credentials_file_path, JSON.stringify(credentials_dict, null, 2) + "\n", "utf-8");
   set_owner_only_permissions(credentials_file_path);
@@ -201,6 +206,7 @@ export function load_credentials(): StoredCredentials {
     agent_identity_urn: (credentials_dict["agent_identity_urn"] as string) ?? null,
     privacy_consent_given_at: (credentials_dict["privacy_consent_given_at"] as string) ?? null,
     default_attestation_mode: (credentials_dict["default_attestation_mode"] as string) ?? null,
+    identity_certificate_chain_pem: (credentials_dict["identity_certificate_chain_pem"] as string) ?? null,
   };
 }
 
