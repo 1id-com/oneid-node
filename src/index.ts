@@ -61,6 +61,15 @@ import {
   type VerifiedPeerIdentity,
 } from "./verify.js";
 import { refresh_trust_roots, get_trust_roots } from "./trustRoots.js";
+import {
+  generateConsentToken,
+  listCredentialPointers,
+  setCredentialPointerVisibility,
+  removeCredentialPointer,
+  type ConsentTokenResult,
+  type CredentialPointerInfo,
+  type CredentialPointerListResult,
+} from "./credentialPointers.js";
 
 // Re-export all exception classes
 export {
@@ -128,8 +137,19 @@ export {
   type VerifiedPeerIdentity,
 };
 
+// Re-export credential pointer functions and types
+export {
+  generateConsentToken,
+  listCredentialPointers,
+  setCredentialPointerVisibility,
+  removeCredentialPointer,
+  type ConsentTokenResult,
+  type CredentialPointerInfo,
+  type CredentialPointerListResult,
+};
+
 /** SDK version string. */
-export const VERSION = "0.6.1";
+export const VERSION = "0.8.0";
 
 /**
  * Check the current enrolled identity.
@@ -288,27 +308,6 @@ export async function setup_tbs(): Promise<boolean> {
   return (result.ok as boolean) ?? false;
 }
 
-/**
- * Record the user's privacy consent choice in the credentials file.
- *
- * After the calling application shows a privacy warning and the user
- * consents, call this to persist their preferred attestation mode.
- *
- * @param mode The user's chosen attestation mode: 'sd-jwt' or 'direct'.
- * @throws NotEnrolledError if no credentials file exists yet.
- * @throws Error if mode is not 'sd-jwt' or 'direct'.
- */
-export function record_privacy_consent(mode: string = "sd-jwt"): void {
-  if (mode !== "sd-jwt" && mode !== "direct") {
-    throw new Error(`Invalid attestation mode '${mode}'. Must be 'sd-jwt' or 'direct'.`);
-  }
-
-  const creds = load_credentials();
-  creds.privacy_consent_given_at = new Date().toISOString();
-  creds.default_attestation_mode = mode;
-  save_credentials(creds);
-}
-
 // Re-export core functions
 export {
   enroll,
@@ -333,7 +332,6 @@ const oneid = {
   whoami,
   refresh,
   setup_tbs,
-  record_privacy_consent,
   credentials_exist,
   authenticate_with_tpm,
   authenticate_with_piv,
@@ -348,6 +346,10 @@ const oneid = {
   verifyPeerIdentity,
   refresh_trust_roots,
   get_trust_roots,
+  generateConsentToken,
+  listCredentialPointers,
+  setCredentialPointerVisibility,
+  removeCredentialPointer,
   VERSION,
   TrustTier,
   KeyAlgorithm,

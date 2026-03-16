@@ -79,7 +79,7 @@ export class HSMAccessError extends EnrollmentError {
  * On Windows, non-admin users cannot access the TPM unless a one-time
  * registry key is set. This exception signals that the calling application
  * should display a privacy warning, call oneid.setup_tbs() if the user
- * consents, call oneid.record_privacy_consent(), and retry enrollment.
+ * consents, and retry enrollment.
  *
  * Distinct from NoHSMError (no TPM) and HSMAccessError (TPM broken/locked).
  */

@@ -199,13 +199,13 @@ export async function authenticate_with_tpm(
     api_base_url = credentials.api_base_url;
   }
 
-  // Step 1: Request a challenge nonce from the server
   const api_client = new OneIDAPIClient(api_base_url, TOKEN_REQUEST_TIMEOUT_MILLISECONDS);
 
   let challenge_data: Record<string, unknown>;
   try {
     challenge_data = await api_client["_make_request"]("POST", "/api/v1/auth/challenge", {
       identity_id,
+      device_type: "tpm",
     });
   } catch (error) {
     if (error instanceof NetworkError) { throw error; }
@@ -298,6 +298,7 @@ export async function authenticate_with_piv(
   try {
     challenge_data = await api_client["_make_request"]("POST", "/api/v1/auth/challenge", {
       identity_id,
+      device_type: "piv",
     });
   } catch (error) {
     if (error instanceof NetworkError) { throw error; }

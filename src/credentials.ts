@@ -57,10 +57,6 @@ export interface StoredCredentials {
   display_name?: string | null;
   /** Agent Identity URN (e.g., 'urn:aid:1id.com:1id-a7b3c9d2'), or null if not yet assigned. */
   agent_identity_urn?: string | null;
-  /** ISO 8601 timestamp of when the user consented to privacy implications. */
-  privacy_consent_given_at?: string | null;
-  /** The user's chosen default attestation mode: 'sd-jwt' or 'direct'. */
-  default_attestation_mode?: string | null;
   /** Full PEM-encoded certificate chain (leaf -> intermediate -> root) issued during enrollment. */
   identity_certificate_chain_pem?: string | null;
 }
@@ -147,12 +143,6 @@ export function save_credentials(credentials: StoredCredentials): string {
   if (credentials.agent_identity_urn != null) {
     credentials_dict["agent_identity_urn"] = credentials.agent_identity_urn;
   }
-  if (credentials.privacy_consent_given_at != null) {
-    credentials_dict["privacy_consent_given_at"] = credentials.privacy_consent_given_at;
-  }
-  if (credentials.default_attestation_mode != null) {
-    credentials_dict["default_attestation_mode"] = credentials.default_attestation_mode;
-  }
   if (credentials.identity_certificate_chain_pem != null) {
     credentials_dict["identity_certificate_chain_pem"] = credentials.identity_certificate_chain_pem;
   }
@@ -204,8 +194,6 @@ export function load_credentials(): StoredCredentials {
     enrolled_at: (credentials_dict["enrolled_at"] as string) ?? null,
     display_name: (credentials_dict["display_name"] as string) ?? null,
     agent_identity_urn: (credentials_dict["agent_identity_urn"] as string) ?? null,
-    privacy_consent_given_at: (credentials_dict["privacy_consent_given_at"] as string) ?? null,
-    default_attestation_mode: (credentials_dict["default_attestation_mode"] as string) ?? null,
     identity_certificate_chain_pem: (credentials_dict["identity_certificate_chain_pem"] as string) ?? null,
   };
 }

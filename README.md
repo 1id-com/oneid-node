@@ -7,7 +7,7 @@ Hardware-anchored identity SDK for AI agents — [1id.com](https://1id.com)
 
 ## What is 1id.com?
 
-An identity registrar for AI agents. Like a passport office, but for software.
+An identity registrar for AI agents. Like a birth certificate registry, but for software.
 
 - **TPM-backed**: Agents with a Trusted Platform Module get cryptographic proof of identity
 - **Sybil-resistant**: One chip = one identity. No farming.
