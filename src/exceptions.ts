@@ -79,7 +79,7 @@ export class HSMAccessError extends EnrollmentError {
  * On Windows, non-admin users cannot access the TPM unless a one-time
  * registry key is set. This exception signals that the calling application
  * should display a privacy warning, call oneid.setup_tbs() if the user
- * consents, call oneid.record_privacy_consent(), and retry enrollment.
+ * consents, and retry enrollment.
  *
  * Distinct from NoHSMError (no TPM) and HSMAccessError (TPM broken/locked).
  */
@@ -141,6 +141,25 @@ export class AuthenticationError extends OneIDError {
 }
 
 /**
+ * Hardware device required for authentication but not detected or not responding.
+ *
+ * Raised by get_token() when the identity's trust_tier is hardware-backed
+ * (sovereign, portable, virtual) but the physical TPM or PIV device is
+ * absent, inaccessible, or the challenge-response signing failed.
+ *
+ * This is an intentional security property: credentials.json for a
+ * hardware-tier identity is useless without the physical device.
+ * get_token() never falls back to bare client_credentials for hardware tiers.
+ */
+export class HardwareDeviceNotPresentError extends AuthenticationError {
+  constructor(message: string = "Hardware device required but not present or not responding") {
+    super(message);
+    this.name = "HardwareDeviceNotPresentError";
+    (this as { error_code: string | null }).error_code = "HARDWARE_DEVICE_NOT_PRESENT";
+  }
+}
+
+/**
  * Could not reach the 1id.com API server.
  */
 export class NetworkError extends OneIDError {
@@ -190,6 +209,7 @@ const SERVER_ERROR_CODE_TO_EXCEPTION_CLASS: Record<string, new (message: string)
   "HANDLE_RETIRED": HandleRetiredError,
   "RATE_LIMIT_EXCEEDED": RateLimitExceededError,
   "RATE_LIMITED": RateLimitExceededError,
+  "HARDWARE_PROOF_REQUIRED": HardwareDeviceNotPresentError,
 };
 
 /**

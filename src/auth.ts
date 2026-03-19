@@ -1,42 +1,45 @@
 /**
  * OAuth2 token management for the 1id.com Node.js SDK.
  *
- * After enrollment, agents authenticate using standard OAuth2
- * client_credentials grant. No TPM operations needed for daily use.
+ * After enrollment, agents authenticate via hardware challenge-response
+ * (TPM for sovereign/virtual, PIV for portable) or OAuth2 client_credentials
+ * grant (declared tier only).
  *
- * This module handles:
- * - Token acquisition (client_credentials grant)
- * - Token caching (in-memory, with expiry awareness)
- * - Token refresh
- * - Authorization header formatting
+ * SECURITY RULE: Hardware-tier identities NEVER fall back to bare
+ * client_credentials. If the hardware device is absent, get_token() throws
+ * HardwareDeviceNotPresentError. This is intentional: a stolen
+ * credentials.json is useless without the physical device.
  */
 
 import { type StoredCredentials, load_credentials } from "./credentials.js";
-import { AuthenticationError, NetworkError } from "./exceptions.js";
+import { AuthenticationError, HardwareDeviceNotPresentError, NetworkError } from "./exceptions.js";
 import type { Token } from "./identity.js";
 import { OneIDAPIClient } from "./client.js";
 
-// -- Configuration --
-const TOKEN_REFRESH_MARGIN_MILLISECONDS = 60_000; // Refresh tokens 60s before expiry
+const TOKEN_REFRESH_MARGIN_MILLISECONDS = 60_000;
 const TOKEN_REQUEST_TIMEOUT_MILLISECONDS = 15_000;
 
-// -- Module-level token cache --
+const TIERS_REQUIRING_HARDWARE_AUTH = new Set(["sovereign", "portable", "virtual"]);
+const TIERS_USING_TPM = new Set(["sovereign", "virtual"]);
+const TIERS_USING_PIV = new Set(["portable"]);
+
 let cached_token: Token | null = null;
 
 /**
  * Get a valid OAuth2 access token, refreshing if needed.
  *
- * This is the primary authentication method for daily use. It uses
- * the OAuth2 client_credentials grant with the credentials stored
- * during enrollment.
+ * For hardware-backed tiers (sovereign, portable, virtual), this invokes
+ * the hardware challenge-response flow via the Go binary. The physical
+ * device must be present. If it is absent, HardwareDeviceNotPresentError
+ * is thrown -- there is NO fallback to bare client_credentials.
  *
- * Tokens are cached in memory and automatically refreshed when they
- * are within 60s of expiry.
+ * For declared tier, the standard OAuth2 client_credentials grant is used.
  *
  * @param force_refresh If true, always fetch a new token even if cached.
  * @param credentials Optional pre-loaded credentials.
  * @returns A valid Token object.
  * @throws NotEnrolledError if no credentials file exists.
+ * @throws HardwareDeviceNotPresentError if hardware tier and device is absent.
  * @throws AuthenticationError if the token request fails.
  * @throws NetworkError if the token endpoint cannot be reached.
  */
@@ -44,7 +47,6 @@ export async function get_token(
   force_refresh: boolean = false,
   credentials?: StoredCredentials | null,
 ): Promise<Token> {
-  // Check if cached token is still valid (with margin)
   if (!force_refresh && cached_token != null) {
     const margin_adjusted_expiry = new Date(cached_token.expires_at.getTime() - TOKEN_REFRESH_MARGIN_MILLISECONDS);
     if (new Date() < margin_adjusted_expiry) {
@@ -52,16 +54,52 @@ export async function get_token(
     }
   }
 
-  // Load credentials
   if (credentials == null) {
     credentials = load_credentials();
   }
 
-  // Request a new token
+  if (TIERS_REQUIRING_HARDWARE_AUTH.has(credentials.trust_tier)) {
+    const token = await authenticate_with_hardware_challenge_response(credentials);
+    cached_token = token;
+    return token;
+  }
+
   const token = await request_token_from_keycloak(credentials);
   cached_token = token;
-
   return token;
+}
+
+async function authenticate_with_hardware_challenge_response(credentials: StoredCredentials): Promise<Token> {
+  if (TIERS_USING_TPM.has(credentials.trust_tier)) {
+    try {
+      return await authenticate_with_tpm(null, null, null, credentials);
+    } catch (error) {
+      if (error instanceof HardwareDeviceNotPresentError) { throw error; }
+      throw new HardwareDeviceNotPresentError(
+        `TPM authentication failed and hardware is required for ` +
+        `${credentials.trust_tier} tier. Device may be absent or ` +
+        `inaccessible: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  if (TIERS_USING_PIV.has(credentials.trust_tier)) {
+    try {
+      return await authenticate_with_piv(null, null, credentials);
+    } catch (error) {
+      if (error instanceof HardwareDeviceNotPresentError) { throw error; }
+      throw new HardwareDeviceNotPresentError(
+        `PIV authentication failed and hardware is required for ` +
+        `${credentials.trust_tier} tier. YubiKey may be absent or ` +
+        `inaccessible: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  throw new HardwareDeviceNotPresentError(
+    `Trust tier '${credentials.trust_tier}' requires hardware but no ` +
+    `supported authentication method is available.`
+  );
 }
 
 /**
@@ -161,13 +199,13 @@ export async function authenticate_with_tpm(
     api_base_url = credentials.api_base_url;
   }
 
-  // Step 1: Request a challenge nonce from the server
   const api_client = new OneIDAPIClient(api_base_url, TOKEN_REQUEST_TIMEOUT_MILLISECONDS);
 
   let challenge_data: Record<string, unknown>;
   try {
     challenge_data = await api_client["_make_request"]("POST", "/api/v1/auth/challenge", {
       identity_id,
+      device_type: "tpm",
     });
   } catch (error) {
     if (error instanceof NetworkError) { throw error; }
@@ -225,6 +263,96 @@ export async function authenticate_with_tpm(
   } else {
     throw new AuthenticationError(
       "TPM signature verified but no tokens were issued. " +
+      "The Keycloak token endpoint may be unavailable."
+    );
+  }
+}
+
+
+/**
+ * Authenticate using a PIV device (YubiKey) -- passwordless sign-in.
+ *
+ * Same challenge-response flow as TPM but uses PIV slot 9a ECDSA signing.
+ * No PIN, no elevation, no human interaction required.
+ */
+export async function authenticate_with_piv(
+  identity_id?: string | null,
+  api_base_url?: string | null,
+  credentials?: StoredCredentials | null,
+): Promise<Token> {
+  if (credentials == null) {
+    credentials = load_credentials();
+  }
+
+  if (identity_id == null) {
+    identity_id = credentials.client_id;
+  }
+
+  if (api_base_url == null) {
+    api_base_url = credentials.api_base_url;
+  }
+
+  const api_client = new OneIDAPIClient(api_base_url, TOKEN_REQUEST_TIMEOUT_MILLISECONDS);
+
+  let challenge_data: Record<string, unknown>;
+  try {
+    challenge_data = await api_client["_make_request"]("POST", "/api/v1/auth/challenge", {
+      identity_id,
+      device_type: "piv",
+    });
+  } catch (error) {
+    if (error instanceof NetworkError) { throw error; }
+    throw new AuthenticationError(
+      `Challenge request failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  const challenge_id = challenge_data.challenge_id as string;
+  const nonce_b64 = challenge_data.nonce_b64 as string;
+
+  if (!challenge_id || !nonce_b64) {
+    throw new AuthenticationError("Server returned incomplete challenge response");
+  }
+
+  const { sign_challenge_with_piv } = await import("./helper.js");
+  const sign_result = await sign_challenge_with_piv(nonce_b64);
+  const signature_b64 = sign_result.signature_b64 ?? "";
+
+  if (!signature_b64) {
+    throw new AuthenticationError("PIV signing returned empty signature");
+  }
+
+  let verify_data: Record<string, unknown>;
+  try {
+    verify_data = await api_client["_make_request"]("POST", "/api/v1/auth/verify", {
+      challenge_id,
+      signature_b64,
+    });
+  } catch (error) {
+    if (error instanceof NetworkError) { throw error; }
+    throw new AuthenticationError(
+      `PIV authentication failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  if (!verify_data.authenticated) {
+    throw new AuthenticationError("Server did not confirm PIV authentication");
+  }
+
+  const tokens = verify_data.tokens as Record<string, unknown> | undefined;
+  if (tokens?.access_token) {
+    const expires_in_seconds = (tokens.expires_in as number) ?? 3600;
+    const token: Token = {
+      access_token: tokens.access_token as string,
+      token_type: (tokens.token_type as string) ?? "Bearer",
+      expires_at: new Date(Date.now() + expires_in_seconds * 1000),
+      refresh_token: (tokens.refresh_token as string) ?? null,
+    };
+    cached_token = token;
+    return token;
+  } else {
+    throw new AuthenticationError(
+      "PIV signature verified but no tokens were issued. " +
       "The Keycloak token endpoint may be unavailable."
     );
   }

@@ -330,4 +330,19 @@ export class OneIDAPIClient {
   async check_handle_availability(handle_name: string): Promise<Record<string, unknown>> {
     return this._make_request("GET", `/api/v1/handle/${handle_name}`);
   }
+
+  /**
+   * Make an authenticated API request with a Bearer token.
+   * Used by world/status, devices, lock-hardware, and operator-email endpoints.
+   */
+  async make_authenticated_request(
+    method: string,
+    api_path: string,
+    access_token: string,
+    json_body?: Record<string, unknown> | null,
+  ): Promise<Record<string, unknown>> {
+    return this._make_request(method, api_path, json_body, {
+      "Authorization": `Bearer ${access_token}`,
+    });
+  }
 }
