@@ -363,7 +363,7 @@ export async function verifyPeerIdentity(
   // Try to extract agent_id from SAN URI
   let verified_agent_id = proof_bundle.agent_id;
   const san_string = leaf_cert.subjectAltName ?? "";
-  const uri_match = san_string.match(/URI:urn:oneid:agent:([^\s,]+)/);
+  const uri_match = san_string.match(/URI:urn:aid:[^:]+:([^\s,]+)/);
   if (uri_match) {
     verified_agent_id = uri_match[1]!;
   }
