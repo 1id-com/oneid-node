@@ -476,3 +476,18 @@ export async function sign_challenge_with_tpm(
     "--ak-handle", ak_handle,
   ]);
 }
+
+/**
+ * Sign a challenge nonce using the Apple Secure Enclave -- NO ELEVATION NEEDED.
+ *
+ * Calls oneid-enroll sign --type enclave, which delegates to the Swift
+ * helper (oneid-se-helper) for CryptoKit-based Secure Enclave signing.
+ */
+export async function sign_challenge_with_enclave(
+  nonce_b64: string,
+): Promise<Record<string, unknown>> {
+  return run_binary_command("sign", [
+    "--nonce", nonce_b64,
+    "--type", "enclave",
+  ]);
+}

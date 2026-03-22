@@ -60,6 +60,21 @@ import {
   type IdentityProofBundle,
   type VerifiedPeerIdentity,
 } from "./verify.js";
+import {
+  prepareAttestation,
+  prepare_direct_hardware_attestation,
+  compute_rfc_message_binding_nonce,
+  canonicalise_headers_for_message_binding,
+  canonicalise_headers_for_direct_attestation,
+  canonicalise_body_using_dkim_simple,
+  canonicalise_header_value_using_dkim_relaxed,
+  canonicalise_header_name_using_dkim_relaxed,
+  compute_attestation_digest_for_direct_mode,
+  build_cms_signed_data_for_direct_attestation,
+  type AttestationProof,
+  type PrepareAttestationOptions,
+  type DirectAttestationProof,
+} from "./attestation.js";
 import { refresh_trust_roots, get_trust_roots } from "./trustRoots.js";
 import {
   generateConsentToken,
@@ -146,6 +161,23 @@ export {
   type ConsentTokenResult,
   type CredentialPointerInfo,
   type CredentialPointerListResult,
+};
+
+// Re-export attestation functions and types
+export {
+  prepareAttestation,
+  prepare_direct_hardware_attestation,
+  compute_rfc_message_binding_nonce,
+  canonicalise_headers_for_message_binding,
+  canonicalise_headers_for_direct_attestation,
+  canonicalise_body_using_dkim_simple,
+  canonicalise_header_value_using_dkim_relaxed,
+  canonicalise_header_name_using_dkim_relaxed,
+  compute_attestation_digest_for_direct_mode,
+  build_cms_signed_data_for_direct_attestation,
+  type AttestationProof,
+  type PrepareAttestationOptions,
+  type DirectAttestationProof,
 };
 
 /** SDK version string. */
@@ -350,6 +382,16 @@ const oneid = {
   listCredentialPointers,
   setCredentialPointerVisibility,
   removeCredentialPointer,
+  prepareAttestation,
+  prepare_direct_hardware_attestation,
+  compute_rfc_message_binding_nonce,
+  canonicalise_headers_for_message_binding,
+  canonicalise_headers_for_direct_attestation,
+  canonicalise_body_using_dkim_simple,
+  canonicalise_header_value_using_dkim_relaxed,
+  canonicalise_header_name_using_dkim_relaxed,
+  compute_attestation_digest_for_direct_mode,
+  build_cms_signed_data_for_direct_attestation,
   VERSION,
   TrustTier,
   KeyAlgorithm,

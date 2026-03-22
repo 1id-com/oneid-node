@@ -226,6 +226,29 @@ export class OneIDAPIClient {
   }
 
   /**
+   * Begin enclave enrollment by submitting the Secure Enclave public key.
+   *
+   * Server validates the P-256 key format, generates a nonce challenge,
+   * and returns a session ID. The client signs the nonce with the Enclave
+   * key and submits it to enroll_activate().
+   */
+  async enroll_begin_enclave(
+    enclave_public_key_pem: string,
+    operator_email?: string | null,
+    requested_handle?: string | null,
+    display_name?: string | null,
+  ): Promise<Record<string, unknown>> {
+    const request_body: Record<string, unknown> = {
+      enclave_public_key_pem,
+    };
+    if (operator_email != null) { request_body["operator_email"] = operator_email; }
+    if (requested_handle != null) { request_body["requested_handle"] = requested_handle; }
+    if (display_name != null) { request_body["display_name"] = display_name; }
+
+    return this._make_request("POST", "/api/v1/enroll/enclave/begin", request_body);
+  }
+
+  /**
    * Complete TPM/HSM-based enrollment by proving HSM possession.
    */
   async enroll_activate(

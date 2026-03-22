@@ -59,6 +59,10 @@ export interface StoredCredentials {
   agent_identity_urn?: string | null;
   /** Full PEM-encoded certificate chain (leaf -> intermediate -> root) issued during enrollment. */
   identity_certificate_chain_pem?: string | null;
+  /** Base64-encoded Secure Enclave dataRepresentation blob (enclave tier only).
+   *  This is a hardware-bound encrypted reference to the SE private key.
+   *  Only the specific Secure Enclave that created it can decrypt it. */
+  enclave_key_data_representation_b64?: string | null;
 }
 
 /**
@@ -146,6 +150,9 @@ export function save_credentials(credentials: StoredCredentials): string {
   if (credentials.identity_certificate_chain_pem != null) {
     credentials_dict["identity_certificate_chain_pem"] = credentials.identity_certificate_chain_pem;
   }
+  if (credentials.enclave_key_data_representation_b64 != null) {
+    credentials_dict["enclave_key_data_representation_b64"] = credentials.enclave_key_data_representation_b64;
+  }
 
   fs.writeFileSync(credentials_file_path, JSON.stringify(credentials_dict, null, 2) + "\n", "utf-8");
   set_owner_only_permissions(credentials_file_path);
@@ -195,6 +202,7 @@ export function load_credentials(): StoredCredentials {
     display_name: (credentials_dict["display_name"] as string) ?? null,
     agent_identity_urn: (credentials_dict["agent_identity_urn"] as string) ?? null,
     identity_certificate_chain_pem: (credentials_dict["identity_certificate_chain_pem"] as string) ?? null,
+    enclave_key_data_representation_b64: (credentials_dict["enclave_key_data_representation_b64"] as string) ?? null,
   };
 }
 

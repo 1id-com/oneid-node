@@ -68,7 +68,7 @@ export interface VerifiedPeerIdentity {
   chain_valid: boolean;
 }
 
-function determine_signing_algorithm_name(creds: StoredCredentials): string {
+export function determine_signing_algorithm_name(creds: StoredCredentials): string {
   const algo = (creds.key_algorithm ?? "").toLowerCase();
   if (algo.includes("ed25519")) { return "EdDSA"; }
   if (algo.includes("p-384") || algo.includes("p384") || algo.includes("ecdsa-p384")) { return "ES384"; }
@@ -95,6 +95,23 @@ async function sign_with_piv(nonce_bytes: Buffer): Promise<{ signature_bytes: Bu
   const algorithm_raw = (result["algorithm"] as string) ?? "ECDSA-SHA256";
   const algorithm = algorithm_raw.toUpperCase().includes("ECDSA") ? "ES256" : algorithm_raw;
   return { signature_bytes: Buffer.from(signature_b64, "base64"), algorithm };
+}
+
+async function sign_with_enclave(
+  nonce_bytes: Buffer,
+  enclave_key_data_representation_b64: string | null | undefined,
+): Promise<{ signature_bytes: Buffer; algorithm: string }> {
+  const { sign_challenge_with_enclave } = await import("./helper.js");
+  const { restore_enclave_key_file_from_credentials_if_missing } = await import("./enroll.js");
+
+  if (enclave_key_data_representation_b64) {
+    restore_enclave_key_file_from_credentials_if_missing(enclave_key_data_representation_b64);
+  }
+
+  const nonce_b64 = nonce_bytes.toString("base64");
+  const result = await sign_challenge_with_enclave(nonce_b64);
+  const signature_b64 = (result["signature_b64"] as string) ?? "";
+  return { signature_bytes: Buffer.from(signature_b64, "base64"), algorithm: "ES256" };
 }
 
 /**
@@ -131,6 +148,13 @@ export async function signChallenge(nonce_bytes: Buffer): Promise<IdentityProofB
     algorithm = result.algorithm;
   } else if (trust_tier === "portable" || creds.hsm_key_reference === "piv-slot-9a") {
     const result = await sign_with_piv(nonce_bytes);
+    signature_bytes = result.signature_bytes;
+    algorithm = result.algorithm;
+  } else if (trust_tier === "enclave") {
+    const result = await sign_with_enclave(
+      nonce_bytes,
+      creds.enclave_key_data_representation_b64,
+    );
     signature_bytes = result.signature_bytes;
     algorithm = result.algorithm;
   } else if (creds.private_key_pem) {

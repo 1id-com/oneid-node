@@ -6,6 +6,7 @@
  * - Declared:  Pure software, generates a keypair, sends public key to server.
  * - Sovereign: Spawns Go binary for TPM operations, two-phase enrollment.
  * - Portable:  Spawns Go binary for YubiKey/PIV operations.
+ * - Enclave:   Spawns Go binary + Swift helper for Apple Secure Enclave.
  * - Virtual:   Spawns Go binary for vTPM operations.
  *
  * When request_tier is omitted, the SDK auto-detects the best available
@@ -16,6 +17,9 @@
  * an exception -- no automatic fallbacks.
  */
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { OneIDAPIClient } from "./client.js";
 import {
   DEFAULT_API_BASE_URL,
@@ -32,10 +36,72 @@ import {
 } from "./identity.js";
 import { generate_keypair } from "./keys.js";
 
+const ENCLAVE_KEY_APPLICATION_TAG = "com.1id.enclave.default";
+const ENCLAVE_KEY_STORAGE_DIRECTORY_NAME = ".1id";
+const ENCLAVE_KEY_STORAGE_SUBDIRECTORY_NAME = "enclave_keys";
+
+/**
+ * Read the SE dataRepresentation blob that oneid-se-helper saved to disk.
+ *
+ * The Swift helper stores this at ~/.1id/enclave_keys/<tag>.key after
+ * generating or loading a Secure Enclave key. We read it and return it
+ * as a base64 string so it can be persisted inside credentials.json.
+ * This blob is hardware-bound: only the specific Secure Enclave that
+ * created it can decrypt the private key reference within.
+ *
+ * Returns null if the file does not exist (non-macOS, or helper not run).
+ */
+export function read_enclave_key_data_representation_from_disk(): string | null {
+  const safe_filename = ENCLAVE_KEY_APPLICATION_TAG
+    .replace(/\//g, "_")
+    .replace(/\.\./g, "_");
+  const enclave_key_file_path = path.join(
+    os.homedir(),
+    ENCLAVE_KEY_STORAGE_DIRECTORY_NAME,
+    ENCLAVE_KEY_STORAGE_SUBDIRECTORY_NAME,
+    `${safe_filename}.key`,
+  );
+  if (!fs.existsSync(enclave_key_file_path)) { return null; }
+  const raw_key_blob_bytes = fs.readFileSync(enclave_key_file_path);
+  return raw_key_blob_bytes.toString("base64");
+}
+
+/**
+ * Restore the on-disk SE key file from the blob stored in credentials.json.
+ *
+ * The Swift helper expects the dataRepresentation at
+ * ~/.1id/enclave_keys/<tag>.key. If that file was deleted (e.g. OS
+ * re-image, cleanup) but the credential still holds the blob, we
+ * recreate the file so the helper can sign without re-enrollment.
+ */
+export function restore_enclave_key_file_from_credentials_if_missing(
+  enclave_key_data_representation_b64: string,
+): void {
+  const safe_filename = ENCLAVE_KEY_APPLICATION_TAG
+    .replace(/\//g, "_")
+    .replace(/\.\./g, "_");
+  const enclave_key_file_path = path.join(
+    os.homedir(),
+    ENCLAVE_KEY_STORAGE_DIRECTORY_NAME,
+    ENCLAVE_KEY_STORAGE_SUBDIRECTORY_NAME,
+    `${safe_filename}.key`,
+  );
+  if (fs.existsSync(enclave_key_file_path)) { return; }
+
+  const enclave_key_directory = path.dirname(enclave_key_file_path);
+  fs.mkdirSync(enclave_key_directory, { recursive: true });
+  const raw_bytes = Buffer.from(enclave_key_data_representation_b64, "base64");
+  fs.writeFileSync(enclave_key_file_path, raw_bytes);
+  if (os.platform() !== "win32") {
+    try { fs.chmodSync(enclave_key_file_path, 0o600); } catch { /* best effort */ }
+  }
+}
+
 /** Trust tiers that require an HSM and the Go binary. */
 const TIERS_REQUIRING_HSM: ReadonlySet<TrustTier> = new Set([
   TrustTier.SOVEREIGN,
   TrustTier.PORTABLE,
+  TrustTier.ENCLAVE,
   TrustTier.VIRTUAL,
 ]);
 
@@ -43,12 +109,14 @@ const TIERS_REQUIRING_HSM: ReadonlySet<TrustTier> = new Set([
 const TIER_TO_HSM_TYPE_PREFERENCES: Readonly<Record<string, string[]>> = {
   [TrustTier.SOVEREIGN]: ["tpm"],
   [TrustTier.PORTABLE]: ["yubikey", "nitrokey", "feitian", "solokeys"],
+  [TrustTier.ENCLAVE]: ["enclave", "secure_enclave"],
   [TrustTier.VIRTUAL]: ["tpm"],
 };
 
 const AUTO_DETECT_TIER_PREFERENCE_ORDER: TrustTier[] = [
   TrustTier.SOVEREIGN,
   TrustTier.PORTABLE,
+  TrustTier.ENCLAVE,
   TrustTier.VIRTUAL,
   TrustTier.DECLARED,
 ];
@@ -149,6 +217,8 @@ async function enroll_at_specific_tier(
     return enroll_declared_tier(operator_email, requested_handle, display_name, key_algorithm, api_base_url);
   } else if (tier === TrustTier.PORTABLE) {
     return enroll_piv_tier(tier, operator_email, requested_handle, display_name, api_base_url);
+  } else if (tier === TrustTier.ENCLAVE) {
+    return enroll_enclave_tier(operator_email, requested_handle, display_name, api_base_url);
   } else if (TIERS_REQUIRING_HSM.has(tier)) {
     return enroll_hsm_tier(tier, operator_email, requested_handle, display_name, api_base_url);
   } else {
@@ -385,6 +455,123 @@ async function enroll_piv_tier(
     display_name,
   };
 }
+
+
+/**
+ * Enroll at the enclave tier using an Apple Secure Enclave.
+ *
+ * Uses the Go binary (oneid-enroll) which delegates to the Swift helper
+ * (oneid-se-helper) for Secure Enclave operations. Flow:
+ * 1. Detect Secure Enclave presence
+ * 2. Get the Enclave P-256 public key
+ * 3. Send public key to server /enroll/enclave/begin
+ * 4. Sign the nonce challenge with the Enclave key
+ * 5. Send signed nonce to server /enroll/activate
+ * 6. Receive identity + OAuth2 credentials
+ * 7. Store credentials locally
+ */
+async function enroll_enclave_tier(
+  operator_email: string | null,
+  requested_handle: string | null,
+  display_name: string | null,
+  api_base_url: string,
+): Promise<Identity> {
+  const { detect_available_hsms, sign_challenge_with_enclave } = await import("./helper.js");
+
+  console.log("[oneid] Enrolling at enclave tier (Apple Secure Enclave required)");
+
+  const detected_hsms = await detect_available_hsms();
+
+  let enclave_hsm: Record<string, unknown> | null = null;
+  for (const hsm of detected_hsms) {
+    if (hsm.type === "enclave" || hsm.type === "secure_enclave") {
+      enclave_hsm = hsm;
+      break;
+    }
+  }
+
+  if (!enclave_hsm) {
+    throw new NoHSMError(
+      "No Apple Secure Enclave found. The 'enclave' tier requires Apple Silicon " +
+      "or a T2-equipped Mac with CryptoKit support."
+    );
+  }
+
+  const enclave_public_key_pem = enclave_hsm.public_key_pem as string;
+  if (!enclave_public_key_pem) {
+    throw new EnrollmentError(
+      "Secure Enclave detected but no public key was returned. " +
+      "The oneid-se-helper may not be available or may have failed."
+    );
+  }
+
+  const api_client = new OneIDAPIClient(api_base_url);
+
+  const begin_response = await api_client.enroll_begin_enclave(
+    enclave_public_key_pem,
+    operator_email,
+    requested_handle,
+    display_name,
+  );
+
+  const nonce_challenge_b64 = begin_response["nonce_challenge"] as string;
+
+  const sign_result = await sign_challenge_with_enclave(nonce_challenge_b64);
+  const signed_nonce_b64 = (sign_result as Record<string, unknown>)["signature_b64"] as string;
+
+  const activate_response = await api_client.enroll_activate(
+    begin_response["enrollment_session_id"] as string,
+    signed_nonce_b64,
+  );
+
+  const identity_data = (activate_response["identity"] ?? {}) as Record<string, unknown>;
+  const credentials_data = (activate_response["credentials"] ?? {}) as Record<string, unknown>;
+
+  const internal_id = (identity_data["agent_id"] ?? identity_data["internal_id"] ?? "") as string;
+  const agent_identity_urn = (identity_data["agent_identity_urn"] ?? "") as string;
+  const handle = (identity_data["handle"] ?? `@${internal_id.slice(0, 12)}`) as string;
+  const trust_tier_str = (identity_data["trust_tier"] ?? "enclave") as string;
+  const enrolled_at_str = (identity_data["registered_at"] ?? new Date().toISOString()) as string;
+
+  const enclave_key_blob_b64 = read_enclave_key_data_representation_from_disk();
+  if (enclave_key_blob_b64 == null) {
+    console.warn(
+      "[oneid] Could not capture enclave dataRepresentation -- " +
+      "key file not found after enrollment. The SE key cannot be " +
+      "restored if ~/.1id/enclave_keys/ is deleted."
+    );
+  }
+
+  const stored_credentials: StoredCredentials = {
+    client_id: (credentials_data["client_id"] ?? internal_id) as string,
+    client_secret: (credentials_data["client_secret"] ?? "") as string,
+    token_endpoint: (credentials_data["token_endpoint"] ?? `${api_base_url}/realms/agents/protocol/openid-connect/token`) as string,
+    api_base_url,
+    trust_tier: trust_tier_str,
+    key_algorithm: "ecdsa-p256",
+    hsm_key_reference: "secure-enclave",
+    enrolled_at: enrolled_at_str,
+    display_name,
+    agent_identity_urn: agent_identity_urn || undefined,
+    identity_certificate_chain_pem: (activate_response["identity_certificate_chain_pem"] as string) ?? undefined,
+    enclave_key_data_representation_b64: enclave_key_blob_b64 ?? undefined,
+  };
+  await save_credentials(stored_credentials);
+
+  return {
+    internal_id,
+    handle,
+    trust_tier: TrustTier.ENCLAVE,
+    hsm_type: HSMType.SECURE_ENCLAVE,
+    hsm_manufacturer: "AAPL",
+    enrolled_at: new Date(enrolled_at_str),
+    device_count: 1,
+    key_algorithm: KeyAlgorithm.ECDSA_P256,
+    agent_identity_urn: agent_identity_urn || null,
+    display_name,
+  };
+}
+
 
 async function enroll_hsm_tier(
   request_tier: TrustTier,
