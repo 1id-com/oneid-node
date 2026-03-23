@@ -181,7 +181,7 @@ export {
 };
 
 /** SDK version string. */
-export const VERSION = "0.8.0";
+export const VERSION = "1.0.0";
 
 /**
  * Check the current enrolled identity.

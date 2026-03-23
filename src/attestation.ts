@@ -519,6 +519,13 @@ export async function prepareAttestation(
     throw new Error("Provide content OR contentDigest, not both.");
   }
 
+  if (!rfc_email_mode_is_active && !simple_content_mode_is_active && includeSdJwt) {
+    throw new Error(
+      "SD-JWT attestation requires content to bind to. " +
+      "Provide emailHeaders + body (RFC email mode), OR content/contentDigest (simple mode)."
+    );
+  }
+
   let effective_content_digest: string | null = null;
   if (content != null) {
     const digest_hex = createHash("sha256").update(content).digest("hex");

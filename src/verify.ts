@@ -346,6 +346,14 @@ export async function verifyPeerIdentity(
   proof_bundle: IdentityProofBundle,
   api_base_url?: string,
 ): Promise<VerifiedPeerIdentity> {
+  if (!proof_bundle.certificate_chain_pem) {
+    throw new MissingIdentityCertificateError(
+      "Proof bundle does not contain a certificate chain. " +
+      "The peer identity may be declared-tier (software only) and was enrolled " +
+      "before certificate issuance was available, or the bundle was incomplete."
+    );
+  }
+
   const chain = parse_pem_bundle_into_certificates(proof_bundle.certificate_chain_pem);
   if (chain.length === 0) {
     throw new CertificateChainValidationError("Proof bundle contains no parseable certificates");
