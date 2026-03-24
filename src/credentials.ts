@@ -23,7 +23,7 @@ import { NotEnrolledError, OneIDError } from "./exceptions.js";
 
 // -- Default server endpoints --
 export const DEFAULT_API_BASE_URL = "https://1id.com";
-export const DEFAULT_TOKEN_ENDPOINT = "https://1id.com/realms/agents/protocol/openid-connect/token";
+export const DEFAULT_TOKEN_ENDPOINT = "https://1id.com/api/v1/auth/token";
 
 // -- Credential file name --
 const CREDENTIALS_FILENAME = "credentials.json";
@@ -161,6 +161,30 @@ export function save_credentials(credentials: StoredCredentials): string {
 }
 
 /**
+ * Check credentials file permissions and fix them if they are too open.
+ *
+ * On Unix/macOS, the file MUST be 0600 (owner read+write only). If group
+ * or other bits are set, this function removes them immediately. This runs
+ * on every load so that permissions cannot drift without being corrected.
+ *
+ * On Windows, %APPDATA% is user-private by default so no check is needed.
+ */
+function verify_and_enforce_owner_only_permissions(file_path: string): void {
+  if (os.platform() === "win32") { return; }
+  try {
+    const file_stat = fs.statSync(file_path);
+    const current_mode = file_stat.mode & 0o7777;
+    const owner_only_mode = 0o600;
+    if (current_mode !== owner_only_mode) {
+      fs.chmodSync(file_path, owner_only_mode);
+    }
+  } catch {
+    // Best effort -- may fail in some environments
+  }
+}
+
+
+/**
  * Load enrollment credentials from the local credentials file.
  *
  * @throws NotEnrolledError if no credentials file exists.
@@ -175,6 +199,8 @@ export function load_credentials(): StoredCredentials {
       "Call oneid.enroll() to create an identity first."
     );
   }
+
+  verify_and_enforce_owner_only_permissions(credentials_file_path);
 
   let raw_json_text: string;
   let credentials_dict: Record<string, unknown>;

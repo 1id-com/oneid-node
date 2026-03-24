@@ -25,7 +25,7 @@ import {
 
 // -- HTTP client configuration --
 const DEFAULT_HTTP_TIMEOUT_MILLISECONDS = 30_000;
-const USER_AGENT = "oneid-sdk-node/0.5.0";
+const USER_AGENT = "oneid-sdk-node/1.0.0";
 
 interface RequestOptions {
   method: string;
@@ -271,79 +271,18 @@ export class OneIDAPIClient {
   /**
    * Get an OAuth2 access token using the client_credentials grant.
    *
-   * NOTE: Keycloak token endpoint expects form-urlencoded, not JSON.
+   * Routes through the 1id API token proxy (POST /api/v1/auth/token)
+   * which enforces hardware-tier rejection before forwarding to Keycloak.
+   * Direct Keycloak token endpoint access is blocked by nginx (F-05 fix).
    */
   async get_token_with_client_credentials(
     client_id: string,
     client_secret: string,
   ): Promise<Record<string, unknown>> {
-    const token_path = "/realms/agents/protocol/openid-connect/token";
-    const form_body = new URLSearchParams({
+    return this._make_request("POST", "/api/v1/auth/token", {
       grant_type: "client_credentials",
       client_id,
       client_secret,
-    }).toString();
-
-    return new Promise((resolve, reject) => {
-      const url = new URL(token_path, this.api_base_url);
-      const is_https = url.protocol === "https:";
-      const transport = is_https ? https : http;
-
-      const req = transport.request(
-        {
-          hostname: url.hostname,
-          port: url.port || (is_https ? 443 : 80),
-          path: url.pathname,
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Content-Length": Buffer.byteLength(form_body).toString(),
-            "User-Agent": USER_AGENT,
-          },
-          timeout: this.timeout_milliseconds,
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on("data", (chunk: Buffer) => { chunks.push(chunk); });
-          res.on("end", () => {
-            const raw_body = Buffer.concat(chunks).toString("utf-8");
-            try {
-              const parsed = JSON.parse(raw_body) as Record<string, unknown>;
-              if (res.statusCode !== 200) {
-                const error_description =
-                  (parsed.error_description as string) ??
-                  (parsed.error as string) ??
-                  `HTTP ${res.statusCode}`;
-                reject(new EnrollmentError(
-                  `Token request failed (HTTP ${res.statusCode}): ${error_description}`
-                ));
-                return;
-              }
-              resolve(parsed);
-            } catch {
-              reject(new NetworkError(
-                `Invalid JSON from token endpoint (HTTP ${res.statusCode}): ${raw_body.slice(0, 200)}`
-              ));
-            }
-          });
-        },
-      );
-
-      req.on("error", (error: Error) => {
-        reject(new NetworkError(
-          `Could not connect to token endpoint ${url.href}: ${error.message}`
-        ));
-      });
-
-      req.on("timeout", () => {
-        req.destroy();
-        reject(new NetworkError(
-          `Token request to ${url.href} timed out after ${this.timeout_milliseconds}ms`
-        ));
-      });
-
-      req.write(form_body);
-      req.end();
     });
   }
 

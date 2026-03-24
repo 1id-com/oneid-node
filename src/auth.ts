@@ -9,6 +9,11 @@
  * client_credentials. If the hardware device is absent, get_token() throws
  * HardwareDeviceNotPresentError. This is intentional: a stolen
  * credentials.json is useless without the physical device.
+ *
+ * Token endpoint (F-05 hardened):
+ *   POST https://1id.com/api/v1/auth/token  (declared tier only)
+ *   POST https://1id.com/api/v1/auth/challenge + /verify  (hardware tiers)
+ *   Direct Keycloak token endpoint is blocked by nginx to external clients.
  */
 
 import { type StoredCredentials, load_credentials } from "./credentials.js";
@@ -19,9 +24,10 @@ import { OneIDAPIClient } from "./client.js";
 const TOKEN_REFRESH_MARGIN_MILLISECONDS = 60_000;
 const TOKEN_REQUEST_TIMEOUT_MILLISECONDS = 15_000;
 
-const TIERS_REQUIRING_HARDWARE_AUTH = new Set(["sovereign", "portable", "virtual"]);
+const TIERS_REQUIRING_HARDWARE_AUTH = new Set(["sovereign", "portable", "enclave", "virtual"]);
 const TIERS_USING_TPM = new Set(["sovereign", "virtual"]);
 const TIERS_USING_PIV = new Set(["portable"]);
+const TIERS_USING_ENCLAVE = new Set(["enclave"]);
 
 let cached_token: Token | null = null;
 
