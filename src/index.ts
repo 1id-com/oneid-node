@@ -77,6 +77,19 @@ import {
 } from "./attestation.js";
 import { refresh_trust_roots, get_trust_roots } from "./trustRoots.js";
 import {
+  send as mailpal_send,
+  activate as mailpal_activate,
+  inbox as mailpal_inbox,
+  get_contact_token as mailpal_get_contact_token,
+  type SendResult as MailpalSendResult,
+  type MailpalAccount,
+  type MailpalActivationChallenge,
+  type InboxMessage as MailpalInboxMessage,
+  type SendOptions as MailpalSendOptions,
+  type ActivateOptions as MailpalActivateOptions,
+  type InboxOptions as MailpalInboxOptions,
+} from "./mailpal.js";
+import {
   generateConsentToken,
   listCredentialPointers,
   setCredentialPointerVisibility,
@@ -180,8 +193,27 @@ export {
   type DirectAttestationProof,
 };
 
+// Re-export mailpal types
+export {
+  type MailpalSendResult,
+  type MailpalAccount,
+  type MailpalActivationChallenge,
+  type MailpalInboxMessage,
+  type MailpalSendOptions,
+  type MailpalActivateOptions,
+  type MailpalInboxOptions,
+};
+
+/** MailPal email sending namespace -- use oneid.mailpal.send(), .activate(), etc. */
+export const mailpal = {
+  send: mailpal_send,
+  activate: mailpal_activate,
+  inbox: mailpal_inbox,
+  get_contact_token: mailpal_get_contact_token,
+};
+
 /** SDK version string. */
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 
 /**
  * Check the current enrolled identity.
@@ -392,6 +424,7 @@ const oneid = {
   canonicalise_header_name_using_dkim_relaxed,
   compute_attestation_digest_for_direct_mode,
   build_cms_signed_data_for_direct_attestation,
+  mailpal,
   VERSION,
   TrustTier,
   KeyAlgorithm,

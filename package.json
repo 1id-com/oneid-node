@@ -1,6 +1,6 @@
 {
   "name": "1id",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Hardware-anchored identity SDK for AI agents -- 1id.com",
   "keywords": [
     "identity",
@@ -32,6 +32,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./mailpal": {
+      "import": "./dist/mailpal.js",
+      "types": "./dist/mailpal.d.ts"
     }
   },
   "files": [

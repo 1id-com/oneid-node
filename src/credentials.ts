@@ -63,6 +63,10 @@ export interface StoredCredentials {
    *  This is a hardware-bound encrypted reference to the SE private key.
    *  Only the specific Secure Enclave that created it can decrypt it. */
   enclave_key_data_representation_b64?: string | null;
+  /** MailPal primary email address assigned during mailpal.activate(). */
+  mailpal_email?: string | null;
+  /** MailPal SMTP app-password assigned during mailpal.activate(). */
+  mailpal_app_password?: string | null;
 }
 
 /**
