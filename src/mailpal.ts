@@ -47,7 +47,7 @@ import { AuthenticationError, NetworkError, NotEnrolledError } from "./exception
 
 const _MAILPAL_API_BASE_URL = "https://mailpal.com";
 const _HTTP_TIMEOUT_MILLISECONDS = 30_000;
-const _USER_AGENT = "oneid-sdk-node/1.1.0";
+const _USER_AGENT = "oneid-sdk-node/1.2.1";
 const _SMTP_HOST = "smtp.mailpal.com";
 const _SMTP_PORT_STARTTLS = 587;
 const _SMTP_TIMEOUT_MILLISECONDS = 30_000;
@@ -113,6 +113,8 @@ export interface SendOptions {
   oneid_api_url?: string | null;
   smtp_host?: string | null;
   smtp_port?: number | null;
+  smtp_username?: string | null;
+  smtp_password?: string | null;
 }
 
 export interface ActivateOptions {
@@ -317,7 +319,7 @@ function _fold_long_header_value_for_smtp_transmission(
   const lines = [first_line];
   while (remaining.length > 0) {
     const chunk = remaining.substring(0, 75);
-    lines.push(" " + chunk);
+    lines.push("\t" + chunk);
     remaining = remaining.substring(75);
   }
   return lines.join("\r\n");
@@ -575,6 +577,11 @@ export async function activate(
  * @param options.bcc - Bcc recipients (hidden from headers).
  * @param options.attestation_mode - "both" | "sd-jwt" | "direct" | "none".
  * @param options.disclosed_claims - SD-JWT claims to disclose (default: ["trust_tier"]).
+ * @param options.smtp_username - Override SMTP auth username (default: stored mailpal_email).
+ *   Use this to send from a different Stalwart account (e.g. alice@example.un.ag)
+ *   while still using the agent's 1id identity for attestation signing.
+ * @param options.smtp_password - Override SMTP auth password. Required when smtp_username
+ *   is set. This is the Stalwart app_password for the account being sent from.
  */
 export async function send(options: SendOptions): Promise<SendResult> {
   const {
@@ -592,23 +599,24 @@ export async function send(options: SendOptions): Promise<SendResult> {
     oneid_api_url = null,
     smtp_host = null,
     smtp_port = null,
+    smtp_username = null,
+    smtp_password = null,
   } = options;
 
   const creds = load_credentials();
 
-  const smtp_auth_email = creds.mailpal_email ?? `${creds.client_id}@mailpal.com`;
-  const smtp_auth_password = creds.mailpal_app_password;
-  if (!smtp_auth_password) {
+  const effective_smtp_auth_username = smtp_username ?? creds.mailpal_email ?? `${creds.client_id}@mailpal.com`;
+  const effective_smtp_auth_password = smtp_password ?? creds.mailpal_app_password;
+  if (!effective_smtp_auth_password) {
     throw new NotEnrolledError(
-      "No MailPal app_password found in stored credentials. " +
-      "Call mailpal.activate() first to create a MailPal account " +
-      "and store SMTP credentials, or manually add mailpal_app_password " +
-      "to credentials.json."
+      "No SMTP password available. Either pass smtp_password explicitly, " +
+      "or call mailpal.activate() first to store SMTP credentials, " +
+      "or manually add mailpal_app_password to credentials.json."
     );
   }
 
   const parsed_from = _parse_address_into_name_and_email(from_address ?? "");
-  const effective_from_email = parsed_from.email || smtp_auth_email;
+  const effective_from_email = parsed_from.email || effective_smtp_auth_username;
   const effective_from_display_name =
     from_display_name ?? parsed_from.display_name ?? creds.display_name ?? "";
 
@@ -737,8 +745,8 @@ export async function send(options: SendOptions): Promise<SendResult> {
 
   await _send_raw_message_via_smtp_with_starttls(
     effective_smtp_host, effective_smtp_port,
-    smtp_auth_email, smtp_auth_password,
-    smtp_auth_email, all_recipient_emails,
+    effective_smtp_auth_username, effective_smtp_auth_password,
+    effective_from_email, all_recipient_emails,
     final_message_bytes, _SMTP_TIMEOUT_MILLISECONDS,
   );
 

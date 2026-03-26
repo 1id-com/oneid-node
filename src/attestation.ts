@@ -57,14 +57,40 @@ export interface PrepareAttestationOptions {
 }
 
 export function canonicalise_header_value_using_dkim_relaxed(raw_value: string): string {
-  let unfolded = raw_value.replace(/\r\n[ ]/g, " ").replace(/\r\n\t/g, " ");
-  unfolded = unfolded.replace(/\n[ ]/g, " ").replace(/\n\t/g, " ");
+  let normalized = raw_value.replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
+  let unfolded = normalized.replace(/\r\n[ \t]/g, " ");
   const compressed = unfolded.replace(/[ \t]+/g, " ");
   return compressed.trim();
 }
 
 export function canonicalise_header_name_using_dkim_relaxed(raw_name: string): string {
   return raw_name.trim().toLowerCase();
+}
+
+export function _select_headers_bottom_up_per_dkim(
+  header_names_from_h_tag: string[],
+  message_headers: Array<[string, string]>,
+): Array<[string, string] | null> {
+  const consumed_indices = new Set<number>();
+  const selected: Array<[string, string] | null> = [];
+  for (const requested_name of header_names_from_h_tag) {
+    const target = requested_name.trim().toLowerCase();
+    let found_index = -1;
+    for (let i = message_headers.length - 1; i >= 0; i--) {
+      if (consumed_indices.has(i)) { continue; }
+      if (message_headers[i][0].trim().toLowerCase() === target) {
+        found_index = i;
+        break;
+      }
+    }
+    if (found_index >= 0) {
+      consumed_indices.add(found_index);
+      selected.push(message_headers[found_index]);
+    } else {
+      selected.push(null);
+    }
+  }
+  return selected;
 }
 
 export function canonicalise_headers_for_message_binding(
@@ -85,19 +111,17 @@ export function canonicalise_headers_for_message_binding(
     }
   }
 
+  const header_names_for_nonce: string[] = [..._MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING];
+  header_names_for_nonce.push(..._MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING);
+
+  const message_header_pairs: Array<[string, string]> = Object.entries(lowered_headers);
+  const selected = _select_headers_bottom_up_per_dkim(header_names_for_nonce, message_header_pairs);
+
   const canonicalised_header_lines: string[] = [];
-
-  for (const required_header_name of _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING) {
-    const canon_name = canonicalise_header_name_using_dkim_relaxed(required_header_name);
-    const canon_value = canonicalise_header_value_using_dkim_relaxed(lowered_headers[required_header_name]);
-    canonicalised_header_lines.push(`${canon_name}:${canon_value}\r\n`);
-  }
-
-  for (const extra_header_name of Object.keys(lowered_headers).sort()) {
-    if (_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING.includes(extra_header_name)) { continue; }
-    if (extra_header_name === "hardware-trust-proof") { continue; }
-    const canon_name = canonicalise_header_name_using_dkim_relaxed(extra_header_name);
-    const canon_value = canonicalise_header_value_using_dkim_relaxed(lowered_headers[extra_header_name]);
+  for (const entry of selected) {
+    if (entry === null) { continue; }
+    const canon_name = canonicalise_header_name_using_dkim_relaxed(entry[0]);
+    const canon_value = canonicalise_header_value_using_dkim_relaxed(entry[1]);
     canonicalised_header_lines.push(`${canon_name}:${canon_value}\r\n`);
   }
 
@@ -110,7 +134,9 @@ export function canonicalise_headers_for_message_binding(
 
 export function canonicalise_body_using_dkim_simple(body_bytes: Buffer): Buffer {
   if (body_bytes.length === 0) { return Buffer.from("\r\n"); }
-  let result = body_bytes;
+  let body_string = body_bytes.toString("binary");
+  body_string = body_string.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n/g, "\r\n");
+  let result = Buffer.from(body_string, "binary");
   while (result.length >= 4 && result.subarray(-4).equals(Buffer.from("\r\n\r\n"))) {
     result = result.subarray(0, -2);
   }
@@ -171,19 +197,22 @@ export function canonicalise_headers_for_direct_attestation(
     }
   }
 
+  const all_header_names: string[] = [..._MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING];
+  const extra_names = Object.keys(lowered_headers).filter(
+    h => !_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING.includes(h) &&
+         h !== "hardware-attestation" && h !== "hardware-trust-proof"
+  ).sort();
+  all_header_names.push(...extra_names);
+  all_header_names.push(...all_header_names);
+
+  const message_header_pairs: Array<[string, string]> = Object.entries(lowered_headers);
+  const selected = _select_headers_bottom_up_per_dkim(all_header_names, message_header_pairs);
+
   const canonicalised_header_lines: string[] = [];
-
-  for (const required_header_name of _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING) {
-    const canon_name = canonicalise_header_name_using_dkim_relaxed(required_header_name);
-    const canon_value = canonicalise_header_value_using_dkim_relaxed(lowered_headers[required_header_name]!);
-    canonicalised_header_lines.push(`${canon_name}:${canon_value}\r\n`);
-  }
-
-  for (const extra_header_name of Object.keys(lowered_headers).sort()) {
-    if (_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING.includes(extra_header_name)) { continue; }
-    if (extra_header_name === "hardware-attestation" || extra_header_name === "hardware-trust-proof") { continue; }
-    const canon_name = canonicalise_header_name_using_dkim_relaxed(extra_header_name);
-    const canon_value = canonicalise_header_value_using_dkim_relaxed(lowered_headers[extra_header_name]!);
+  for (const entry of selected) {
+    if (entry === null) { continue; }
+    const canon_name = canonicalise_header_name_using_dkim_relaxed(entry[0]);
+    const canon_value = canonicalise_header_value_using_dkim_relaxed(entry[1]);
     canonicalised_header_lines.push(`${canon_name}:${canon_value}\r\n`);
   }
 
@@ -411,14 +440,13 @@ export async function prepare_direct_hardware_attestation(
   for (const [k, v] of Object.entries(email_headers)) {
     lowered_headers[k.trim().toLowerCase()] = v;
   }
-  let signed_header_names = _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING.join(":");
+  const all_signed_names: string[] = [..._MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING];
   const extra_header_names = Object.keys(lowered_headers).filter(
     h => !_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING.includes(h) &&
          h !== "hardware-attestation" && h !== "hardware-trust-proof"
   ).sort();
-  if (extra_header_names.length > 0) {
-    signed_header_names += ":" + extra_header_names.join(":");
-  }
+  all_signed_names.push(...extra_header_names);
+  const signed_header_names = all_signed_names.join(":") + ":" + all_signed_names.join(":");
 
   let algorithm_for_header: string;
   if (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") {

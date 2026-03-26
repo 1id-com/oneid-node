@@ -157,6 +157,12 @@ export function save_credentials(credentials: StoredCredentials): string {
   if (credentials.enclave_key_data_representation_b64 != null) {
     credentials_dict["enclave_key_data_representation_b64"] = credentials.enclave_key_data_representation_b64;
   }
+  if (credentials.mailpal_email != null) {
+    credentials_dict["mailpal_email"] = credentials.mailpal_email;
+  }
+  if (credentials.mailpal_app_password != null) {
+    credentials_dict["mailpal_app_password"] = credentials.mailpal_app_password;
+  }
 
   fs.writeFileSync(credentials_file_path, JSON.stringify(credentials_dict, null, 2) + "\n", "utf-8");
   set_owner_only_permissions(credentials_file_path);
@@ -233,6 +239,8 @@ export function load_credentials(): StoredCredentials {
     agent_identity_urn: (credentials_dict["agent_identity_urn"] as string) ?? null,
     identity_certificate_chain_pem: (credentials_dict["identity_certificate_chain_pem"] as string) ?? null,
     enclave_key_data_representation_b64: (credentials_dict["enclave_key_data_representation_b64"] as string) ?? null,
+    mailpal_email: (credentials_dict["mailpal_email"] as string) ?? null,
+    mailpal_app_password: (credentials_dict["mailpal_app_password"] as string) ?? null,
   };
 }
 

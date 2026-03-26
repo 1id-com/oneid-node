@@ -213,7 +213,7 @@ export const mailpal = {
 };
 
 /** SDK version string. */
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.1";
 
 /**
  * Check the current enrolled identity.
