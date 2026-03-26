@@ -449,10 +449,10 @@ export async function prepare_direct_hardware_attestation(
   const signed_header_names = all_signed_names.join(":") + ":" + all_signed_names.join(":");
 
   let algorithm_for_header: string;
-  if (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") {
-    algorithm_for_header = "RS256";
-  } else if (trust_tier === "portable" || trust_tier === "enclave" || creds.hsm_key_reference === "piv-slot-9a") {
+  if (trust_tier === "portable" || trust_tier === "enclave") {
     algorithm_for_header = "ES256";
+  } else if (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") {
+    algorithm_for_header = "RS256";
   } else if (creds.private_key_pem) {
     const { determine_signing_algorithm_name } = await import("./verify.js");
     algorithm_for_header = determine_signing_algorithm_name(creds);
@@ -474,17 +474,17 @@ export async function prepare_direct_hardware_attestation(
   );
 
   let signature_bytes: Buffer;
-  if (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") {
-    const { sign_challenge_with_tpm } = await import("./helper.js");
-    const result = await sign_challenge_with_tpm(attestation_digest.toString("base64"), creds.hsm_key_reference ?? "");
-    signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
-  } else if (trust_tier === "portable" || creds.hsm_key_reference === "piv-slot-9a") {
+  if (trust_tier === "portable") {
     const { sign_challenge_with_piv } = await import("./helper.js");
     const result = await sign_challenge_with_piv(attestation_digest.toString("base64"));
     signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
   } else if (trust_tier === "enclave") {
     const { sign_challenge_with_enclave } = await import("./helper.js");
     const result = await sign_challenge_with_enclave(attestation_digest.toString("base64"));
+    signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
+  } else if (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") {
+    const { sign_challenge_with_tpm } = await import("./helper.js");
+    const result = await sign_challenge_with_tpm(attestation_digest.toString("base64"), creds.hsm_key_reference ?? "");
     signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
   } else if (creds.private_key_pem) {
     const { sign_challenge_with_private_key } = await import("./keys.js");
