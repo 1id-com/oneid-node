@@ -477,17 +477,59 @@ export async function sign_challenge_with_tpm(
   ]);
 }
 
+const ENCLAVE_DEFAULT_KEY_TAG = "com.1id.enclave.default";
+
+function find_secure_enclave_helper_binary(): string | null {
+  const se_helper_name = "oneid-se-helper";
+
+  const cache_dir = get_binary_cache_directory();
+  const cached_path = path.join(cache_dir, se_helper_name);
+  if (file_exists_and_is_executable(cached_path)) { return cached_path; }
+
+  const main_binary = find_binary();
+  if (main_binary != null) {
+    const sibling_path = path.join(path.dirname(main_binary), se_helper_name);
+    if (file_exists_and_is_executable(sibling_path)) { return sibling_path; }
+  }
+
+  const home_oneid_path = path.join(os.homedir(), ".oneid", "bin", se_helper_name);
+  if (file_exists_and_is_executable(home_oneid_path)) { return home_oneid_path; }
+
+  return null;
+}
+
 /**
  * Sign a challenge nonce using the Apple Secure Enclave -- NO ELEVATION NEEDED.
  *
- * Calls oneid-enroll sign --type enclave, which delegates to the Swift
- * helper (oneid-se-helper) for CryptoKit-based Secure Enclave signing.
+ * Uses the oneid-se-helper Swift binary directly (NOT oneid-enroll, which
+ * does not support enclave signing).
+ * Only available on macOS with Apple Silicon or T2 security chip.
  */
 export async function sign_challenge_with_enclave(
   nonce_b64: string,
 ): Promise<Record<string, unknown>> {
-  return run_binary_command("sign", [
-    "--nonce", nonce_b64,
-    "--type", "enclave",
-  ]);
+  const se_helper_path = find_secure_enclave_helper_binary();
+  if (se_helper_path == null) {
+    throw new NoHSMError(
+      "oneid-se-helper binary not found. "
+      + "It should be in ~/.oneid/bin/ alongside oneid-enroll."
+    );
+  }
+
+  const cmd_args = ["sign", "--tag", ENCLAVE_DEFAULT_KEY_TAG, "--nonce", nonce_b64];
+
+  try {
+    const stdout = child_process.execFileSync(se_helper_path, cmd_args, {
+      timeout: 30000,
+      encoding: "utf-8",
+    });
+    const output = JSON.parse(stdout);
+    if (output.status !== "ok") {
+      throw new HSMAccessError(`oneid-se-helper sign returned error: ${output.error ?? "unknown"}`);
+    }
+    return output;
+  } catch (error: any) {
+    if (error instanceof HSMAccessError || error instanceof NoHSMError) { throw error; }
+    throw new HSMAccessError(`oneid-se-helper sign failed: ${error.message ?? error}`);
+  }
 }

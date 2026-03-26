@@ -600,12 +600,25 @@ export async function prepareAttestation(
       nonce_value = Buffer.from(message_hash, "hex").toString("base64url");
     }
 
+    const hsm_ref = creds.hsm_key_reference ?? "";
+    let session_device_type_for_dynamic_trust_tiering: string | undefined;
+    if (hsm_ref.startsWith("piv-")) {
+      session_device_type_for_dynamic_trust_tiering = "piv";
+    } else if (hsm_ref === "secure-enclave") {
+      session_device_type_for_dynamic_trust_tiering = "enclave";
+    } else if (creds.trust_tier === "virtual") {
+      session_device_type_for_dynamic_trust_tiering = "vtpm";
+    } else if (creds.key_algorithm === "tpm-ak") {
+      session_device_type_for_dynamic_trust_tiering = "tpm";
+    }
+
     const sd_jwt_result = await _fetch_sd_jwt_proof_for_message(
       effective_api_base_url,
       auth_headers,
       nonce_value,
       proposed_iat,
       disclosedClaims,
+      session_device_type_for_dynamic_trust_tiering,
     );
     proof.sd_jwt = sd_jwt_result.sd_jwt;
     proof.sd_jwt_disclosures = sd_jwt_result.disclosures;
@@ -626,17 +639,21 @@ async function _fetch_sd_jwt_proof_for_message(
   precomputed_nonce: string,
   proposed_iat: number,
   disclosed_claims: string[],
+  session_device_type?: string,
 ): Promise<{ sd_jwt: string | null; disclosures: Record<string, string> }> {
   const url = `${api_base_url}/api/v1/proof/sd-jwt/message`;
+
+  const request_body: Record<string, any> = {
+    nonce: precomputed_nonce,
+    proposed_iat,
+    disclosed_claims,
+  };
+  if (session_device_type) { request_body.device_type = session_device_type; }
 
   const response = await fetch(url, {
     method: "POST",
     headers: auth_headers,
-    body: JSON.stringify({
-      nonce: precomputed_nonce,
-      proposed_iat,
-      disclosed_claims,
-    }),
+    body: JSON.stringify(request_body),
     signal: AbortSignal.timeout(_HTTP_TIMEOUT_MILLISECONDS),
   });
 
