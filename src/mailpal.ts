@@ -98,6 +98,14 @@ export interface InboxMessage {
 // Options types
 // ---------------------------------------------------------------------------
 
+export interface EmailAttachment {
+  filename: string;
+  content_base64: string;
+  content_type?: string;
+  inline?: boolean;
+  content_id?: string;
+}
+
 export interface SendOptions {
   to: string[];
   subject: string;
@@ -107,6 +115,10 @@ export interface SendOptions {
   from_display_name?: string | null;
   cc?: string[] | null;
   bcc?: string[] | null;
+  reply_to?: string | null;
+  in_reply_to?: string | null;
+  references?: string | null;
+  attachments?: EmailAttachment[] | null;
   include_attestation?: boolean;
   attestation_mode?: "both" | "sd-jwt" | "direct" | "none";
   disclosed_claims?: string[] | null;
@@ -265,16 +277,87 @@ function _generate_unique_message_id_for_mailpal_domain(): string {
   return `<${timestamp}.${random_hex}@mailpal.com>`;
 }
 
+function _generate_mime_boundary(): string {
+  return "----=_Part_" + crypto.randomBytes(16).toString("hex");
+}
+
 function _build_mime_message_as_wire_format_bytes(
   ordered_headers: Array<[string, string]>,
   body_text: string,
+  html_body?: string | null,
+  attachments?: EmailAttachment[] | null,
 ): Buffer {
   const header_lines = ordered_headers.map(([name, value]) => `${name}: ${value}`);
-  header_lines.push('Content-Type: text/plain; charset="utf-8"');
-  header_lines.push("Content-Transfer-Encoding: 7bit");
   header_lines.push("MIME-Version: 1.0");
-  const header_section = header_lines.join("\r\n");
-  return Buffer.from(header_section + "\r\n\r\n" + body_text + "\r\n", "utf-8");
+
+  const has_attachments = attachments && attachments.length > 0;
+  const has_both_text_and_html = body_text && html_body;
+
+  if (!has_attachments && !has_both_text_and_html) {
+    if (html_body) {
+      header_lines.push('Content-Type: text/html; charset="utf-8"');
+    } else {
+      header_lines.push('Content-Type: text/plain; charset="utf-8"');
+    }
+    header_lines.push("Content-Transfer-Encoding: 7bit");
+    const header_section = header_lines.join("\r\n");
+    return Buffer.from(header_section + "\r\n\r\n" + (html_body || body_text) + "\r\n", "utf-8");
+  }
+
+  const mixed_boundary = _generate_mime_boundary();
+  header_lines.push(`Content-Type: multipart/mixed; boundary="${mixed_boundary}"`);
+  const parts: string[] = [];
+  parts.push(header_lines.join("\r\n") + "\r\n");
+  parts.push(`\r\n--${mixed_boundary}\r\n`);
+
+  if (has_both_text_and_html) {
+    const alt_boundary = _generate_mime_boundary();
+    parts.push(`Content-Type: multipart/alternative; boundary="${alt_boundary}"\r\n`);
+    parts.push(`\r\n--${alt_boundary}\r\n`);
+    parts.push('Content-Type: text/plain; charset="utf-8"\r\n');
+    parts.push("Content-Transfer-Encoding: 7bit\r\n");
+    parts.push(`\r\n${body_text}\r\n`);
+    parts.push(`\r\n--${alt_boundary}\r\n`);
+    parts.push('Content-Type: text/html; charset="utf-8"\r\n');
+    parts.push("Content-Transfer-Encoding: 7bit\r\n");
+    parts.push(`\r\n${html_body}\r\n`);
+    parts.push(`\r\n--${alt_boundary}--\r\n`);
+  } else {
+    if (html_body) {
+      parts.push('Content-Type: text/html; charset="utf-8"\r\n');
+    } else {
+      parts.push('Content-Type: text/plain; charset="utf-8"\r\n');
+    }
+    parts.push("Content-Transfer-Encoding: 7bit\r\n");
+    parts.push(`\r\n${html_body || body_text}\r\n`);
+  }
+
+  if (has_attachments) {
+    for (const attachment of attachments!) {
+      parts.push(`\r\n--${mixed_boundary}\r\n`);
+      const mime_type = attachment.content_type || "application/octet-stream";
+      const encoded_filename = _encode_as_rfc2047_base64_if_non_ascii(attachment.filename);
+      if (attachment.inline && attachment.content_id) {
+        parts.push(`Content-Type: ${mime_type}; name="${encoded_filename}"\r\n`);
+        parts.push("Content-Transfer-Encoding: base64\r\n");
+        parts.push(`Content-ID: <${attachment.content_id}>\r\n`);
+        parts.push(`Content-Disposition: inline; filename="${encoded_filename}"\r\n`);
+      } else {
+        parts.push(`Content-Type: ${mime_type}; name="${encoded_filename}"\r\n`);
+        parts.push("Content-Transfer-Encoding: base64\r\n");
+        parts.push(`Content-Disposition: attachment; filename="${encoded_filename}"\r\n`);
+      }
+      const raw_base64 = attachment.content_base64;
+      const folded_base64_lines: string[] = [];
+      for (let i = 0; i < raw_base64.length; i += 76) {
+        folded_base64_lines.push(raw_base64.substring(i, i + 76));
+      }
+      parts.push("\r\n" + folded_base64_lines.join("\r\n") + "\r\n");
+    }
+  }
+
+  parts.push(`\r\n--${mixed_boundary}--\r\n`);
+  return Buffer.from(parts.join(""), "utf-8");
 }
 
 function _extract_wire_format_headers_from_raw_bytes(
@@ -593,6 +676,10 @@ export async function send(options: SendOptions): Promise<SendResult> {
     from_display_name = null,
     cc = null,
     bcc = null,
+    reply_to = null,
+    in_reply_to = null,
+    references = null,
+    attachments = null,
     include_attestation = true,
     attestation_mode = "both",
     disclosed_claims = null,
@@ -639,10 +726,19 @@ export async function send(options: SendOptions): Promise<SendResult> {
   if (cc && cc.length > 0) {
     ordered_mime_headers.push(["Cc", cc.join(", ")]);
   }
+  if (reply_to) {
+    ordered_mime_headers.push(["Reply-To", reply_to]);
+  }
+  if (in_reply_to) {
+    ordered_mime_headers.push(["In-Reply-To", in_reply_to]);
+  }
+  if (references) {
+    ordered_mime_headers.push(["References", references]);
+  }
 
   const effective_body = text_body ?? html_body ?? "";
   const wire_format_message_bytes = _build_mime_message_as_wire_format_bytes(
-    ordered_mime_headers, effective_body,
+    ordered_mime_headers, effective_body, html_body, attachments,
   );
 
   // -- Phase 2: Extract wire-format headers (same as milter would parse) --
@@ -798,8 +894,8 @@ export async function inbox(options?: InboxOptions): Promise<InboxMessage[]> {
     message_id: (msg["id"] as string) ?? "",
     from_address: (msg["from"] as string) ?? "",
     subject: (msg["subject"] as string) ?? "",
-    received_at: (msg["received_at"] as string) ?? "",
-    is_unread: (msg["is_unread"] as boolean) ?? true,
+    received_at: (msg["date"] as string) ?? (msg["received_at"] as string) ?? "",
+    is_unread: msg["is_read"] !== undefined ? !(msg["is_read"] as boolean) : (msg["is_unread"] as boolean) ?? true,
   }));
 }
 

@@ -88,6 +88,7 @@ import {
   type SendOptions as MailpalSendOptions,
   type ActivateOptions as MailpalActivateOptions,
   type InboxOptions as MailpalInboxOptions,
+  type EmailAttachment as MailpalEmailAttachment,
 } from "./mailpal.js";
 import {
   generateConsentToken,
@@ -202,6 +203,7 @@ export {
   type MailpalSendOptions,
   type MailpalActivateOptions,
   type MailpalInboxOptions,
+  type MailpalEmailAttachment,
 };
 
 /** MailPal email sending namespace -- use oneid.mailpal.send(), .activate(), etc. */
