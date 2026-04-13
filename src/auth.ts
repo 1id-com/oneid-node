@@ -76,6 +76,21 @@ export async function get_token(
 }
 
 async function authenticate_with_hardware_challenge_response(credentials: StoredCredentials): Promise<Token> {
+  const local_device_is_piv = (credentials.hsm_key_reference ?? "").startsWith("piv-");
+
+  if (local_device_is_piv || TIERS_USING_PIV.has(credentials.trust_tier)) {
+    try {
+      return await authenticate_with_piv(null, null, credentials);
+    } catch (error) {
+      if (error instanceof HardwareDeviceNotPresentError) { throw error; }
+      throw new HardwareDeviceNotPresentError(
+        `PIV authentication failed and hardware is required for ` +
+        `${credentials.trust_tier} tier. YubiKey may be absent or ` +
+        `inaccessible: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
   if (TIERS_USING_TPM.has(credentials.trust_tier)) {
     try {
       return await authenticate_with_tpm(null, null, null, credentials);
@@ -89,14 +104,14 @@ async function authenticate_with_hardware_challenge_response(credentials: Stored
     }
   }
 
-  if (TIERS_USING_PIV.has(credentials.trust_tier)) {
+  if (TIERS_USING_ENCLAVE.has(credentials.trust_tier)) {
     try {
-      return await authenticate_with_piv(null, null, credentials);
+      return await authenticate_with_enclave(null, null, credentials);
     } catch (error) {
       if (error instanceof HardwareDeviceNotPresentError) { throw error; }
       throw new HardwareDeviceNotPresentError(
-        `PIV authentication failed and hardware is required for ` +
-        `${credentials.trust_tier} tier. YubiKey may be absent or ` +
+        `Secure Enclave authentication failed and hardware is required for ` +
+        `${credentials.trust_tier} tier. Enclave may be absent or ` +
         `inaccessible: ${error instanceof Error ? error.message : String(error)}`
       );
     }
@@ -359,6 +374,105 @@ export async function authenticate_with_piv(
   } else {
     throw new AuthenticationError(
       "PIV signature verified but no tokens were issued. " +
+      "The Keycloak token endpoint may be unavailable."
+    );
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Secure Enclave authentication (enclave tier -- Apple Silicon Macs)
+// ---------------------------------------------------------------------------
+
+/**
+ * Authenticate using the Apple Secure Enclave -- passwordless sign-in.
+ *
+ * Same challenge-response flow as TPM/PIV but uses the P-256 key stored
+ * in the Secure Enclave via the oneid-se-helper binary.
+ *
+ * @param identity_id The 1id internal ID. If null, loaded from credentials.
+ * @param api_base_url Base URL for the 1id API.
+ * @param credentials Pre-loaded credentials. If null, loaded from file.
+ * @returns A valid Token object.
+ */
+export async function authenticate_with_enclave(
+  identity_id?: string | null,
+  api_base_url?: string | null,
+  credentials?: StoredCredentials | null,
+): Promise<Token> {
+  if (credentials == null) {
+    credentials = load_credentials();
+  }
+
+  if (identity_id == null) {
+    identity_id = credentials.client_id;
+  }
+
+  if (api_base_url == null) {
+    api_base_url = credentials.api_base_url;
+  }
+
+  const api_client = new OneIDAPIClient(api_base_url, TOKEN_REQUEST_TIMEOUT_MILLISECONDS);
+
+  let challenge_data: Record<string, unknown>;
+  try {
+    challenge_data = await api_client["_make_request"]("POST", "/api/v1/auth/challenge", {
+      identity_id,
+      device_type: "enclave",
+    });
+  } catch (error) {
+    if (error instanceof NetworkError) { throw error; }
+    throw new AuthenticationError(
+      `Challenge request failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  const challenge_id = challenge_data.challenge_id as string;
+  const nonce_b64 = challenge_data.nonce_b64 as string;
+
+  if (!challenge_id || !nonce_b64) {
+    throw new AuthenticationError("Server returned incomplete challenge response");
+  }
+
+  const { sign_challenge_with_enclave } = await import("./helper.js");
+  const sign_result = await sign_challenge_with_enclave(nonce_b64);
+  const signature_b64 = (sign_result.signature_b64 as string) ?? "";
+
+  if (!signature_b64) {
+    throw new AuthenticationError("Secure Enclave signing returned empty signature");
+  }
+
+  let verify_data: Record<string, unknown>;
+  try {
+    verify_data = await api_client["_make_request"]("POST", "/api/v1/auth/verify", {
+      challenge_id,
+      signature_b64,
+    });
+  } catch (error) {
+    if (error instanceof NetworkError) { throw error; }
+    throw new AuthenticationError(
+      `Secure Enclave authentication failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  if (!verify_data.authenticated) {
+    throw new AuthenticationError("Server did not confirm Secure Enclave authentication");
+  }
+
+  const tokens = verify_data.tokens as Record<string, unknown> | undefined;
+  if (tokens?.access_token) {
+    const expires_in_seconds = (tokens.expires_in as number) ?? 3600;
+    const token: Token = {
+      access_token: tokens.access_token as string,
+      token_type: (tokens.token_type as string) ?? "Bearer",
+      expires_at: new Date(Date.now() + expires_in_seconds * 1000),
+      refresh_token: (tokens.refresh_token as string) ?? null,
+    };
+    cached_token = token;
+    return token;
+  } else {
+    throw new AuthenticationError(
+      "Secure Enclave signature verified but no tokens were issued. " +
       "The Keycloak token endpoint may be unavailable."
     );
   }
