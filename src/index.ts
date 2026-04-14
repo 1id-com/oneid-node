@@ -44,10 +44,18 @@ import {
 } from "./world.js";
 import {
   listDevices,
+  addDevice,
+  burnDevice,
+  requestBurn,
+  confirmBurn,
   lockHardware,
   registerOperatorEmail,
+  DeviceManagementError,
   type DeviceInfo,
   type DeviceListResult,
+  type DeviceAddResult,
+  type BurnRequestResult,
+  type BurnConfirmResult,
   type HardwareLockResult,
 } from "./devices.js";
 import {
@@ -145,10 +153,14 @@ export {
   invalidate_world_cache,
 };
 
-// Re-export device management types
+// Re-export device management types and error
 export {
+  DeviceManagementError,
   type DeviceInfo,
   type DeviceListResult,
+  type DeviceAddResult,
+  type BurnRequestResult,
+  type BurnConfirmResult,
   type HardwareLockResult,
 };
 
@@ -385,6 +397,10 @@ export {
   credentials_exist,
   sign_challenge_with_private_key,
   listDevices,
+  addDevice,
+  burnDevice,
+  requestBurn,
+  confirmBurn,
   lockHardware,
   registerOperatorEmail,
 };
@@ -406,6 +422,10 @@ const oneid = {
   format_identity_as_display_string,
   invalidate_world_cache,
   listDevices,
+  addDevice,
+  burnDevice,
+  requestBurn,
+  confirmBurn,
   lockHardware,
   registerOperatorEmail,
   signChallenge,
