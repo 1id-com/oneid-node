@@ -33,6 +33,7 @@
 import * as net from "node:net";
 import * as tls from "node:tls";
 import * as crypto from "node:crypto";
+import * as dns from "node:dns";
 import * as https from "node:https";
 import * as http from "node:http";
 import { get_token } from "./auth.js";
@@ -64,6 +65,7 @@ export interface SendResult {
   contact_token_header_included: boolean;
   sd_jwt_header_included: boolean;
   direct_attestation_header_included: boolean;
+  rfc5322_message_bytes?: Buffer | null;
 }
 
 export interface MailpalAccount {
@@ -127,6 +129,10 @@ export interface SendOptions {
   smtp_port?: number | null;
   smtp_username?: string | null;
   smtp_password?: string | null;
+  smtp_domain?: string | null;
+  smtp_security?: "starttls" | "tls" | "none" | null;
+  smtp_envelope_from?: string | null;
+  deliver?: boolean;
 }
 
 export interface ActivateOptions {
@@ -536,6 +542,212 @@ function _send_raw_message_via_smtp_with_starttls(
 
 
 // ---------------------------------------------------------------------------
+// SMTP client with direct TLS (connect via tls.connect, AUTH PLAIN)
+// ---------------------------------------------------------------------------
+
+function _send_raw_message_via_smtp_with_direct_tls(
+  host: string,
+  port: number,
+  auth_email: string,
+  auth_password: string,
+  envelope_from: string,
+  envelope_to_list: string[],
+  message_bytes: Buffer,
+  timeout_ms: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect(
+      { host, port, servername: host, rejectUnauthorized: true, timeout: timeout_ms },
+      () => {
+        socket.on("data", on_smtp_data);
+      },
+    );
+    let command_queue: string[] = [];
+    let response_buffer = "";
+    let phase = "greeting";
+
+    function on_smtp_data(data: Buffer): void {
+      response_buffer += data.toString("utf-8");
+      while (response_buffer.includes("\r\n")) {
+        const line_end = response_buffer.indexOf("\r\n");
+        const line = response_buffer.substring(0, line_end);
+        response_buffer = response_buffer.substring(line_end + 2);
+        const code = parseInt(line.substring(0, 3), 10);
+        const is_continuation = line[3] === "-";
+        if (!is_continuation) { handle_smtp_response_line(code, line); }
+      }
+    }
+
+    function send_smtp_command(cmd: string): void {
+      socket.write(cmd + "\r\n");
+    }
+
+    function handle_smtp_response_line(code: number, line: string): void {
+      if (phase === "greeting") {
+        if (code !== 220) { return reject(new NetworkError(`SMTP greeting failed: ${line}`)); }
+        phase = "ehlo";
+        send_smtp_command("EHLO oneid-sdk");
+      } else if (phase === "ehlo") {
+        if (code !== 250) { return reject(new NetworkError(`SMTP EHLO failed: ${line}`)); }
+        phase = "auth";
+        const auth_string = Buffer.from(`\x00${auth_email}\x00${auth_password}`).toString("base64");
+        send_smtp_command(`AUTH PLAIN ${auth_string}`);
+      } else if (phase === "auth") {
+        if (code !== 235) { return reject(new AuthenticationError(`SMTP authentication failed: ${line}`)); }
+        phase = "mail_from";
+        send_smtp_command(`MAIL FROM:<${envelope_from}>`);
+      } else if (phase === "mail_from") {
+        if (code !== 250) { return reject(new NetworkError(`SMTP MAIL FROM failed: ${line}`)); }
+        phase = "rcpt_to";
+        command_queue = [...envelope_to_list];
+        send_smtp_command(`RCPT TO:<${command_queue.shift()!}>`);
+      } else if (phase === "rcpt_to") {
+        if (code !== 250) { return reject(new NetworkError(`SMTP RCPT TO failed: ${line}`)); }
+        if (command_queue.length > 0) {
+          send_smtp_command(`RCPT TO:<${command_queue.shift()!}>`);
+        } else {
+          phase = "data_cmd";
+          send_smtp_command("DATA");
+        }
+      } else if (phase === "data_cmd") {
+        if (code !== 354) { return reject(new NetworkError(`SMTP DATA command failed: ${line}`)); }
+        phase = "data_done";
+        socket.write(message_bytes);
+        socket.write(Buffer.from("\r\n.\r\n"));
+      } else if (phase === "data_done") {
+        if (code !== 250) { return reject(new NetworkError(`SMTP message rejected: ${line}`)); }
+        phase = "quit";
+        send_smtp_command("QUIT");
+      } else if (phase === "quit") {
+        socket.destroy();
+        resolve();
+      }
+    }
+
+    socket.on("error", (err: Error) => {
+      reject(new NetworkError(`SMTP TLS connection error: ${err.message}`));
+    });
+    socket.on("timeout", () => {
+      socket.destroy();
+      reject(new NetworkError("SMTP TLS connection timed out"));
+    });
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// SMTP client with no encryption (plain TCP, AUTH PLAIN)
+// ---------------------------------------------------------------------------
+
+function _send_raw_message_via_plain_smtp_without_encryption(
+  host: string,
+  port: number,
+  auth_email: string,
+  auth_password: string,
+  envelope_from: string,
+  envelope_to_list: string[],
+  message_bytes: Buffer,
+  timeout_ms: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host, port, timeout: timeout_ms });
+    let command_queue: string[] = [];
+    let response_buffer = "";
+    let phase = "greeting";
+
+    function on_smtp_data(data: Buffer): void {
+      response_buffer += data.toString("utf-8");
+      while (response_buffer.includes("\r\n")) {
+        const line_end = response_buffer.indexOf("\r\n");
+        const line = response_buffer.substring(0, line_end);
+        response_buffer = response_buffer.substring(line_end + 2);
+        const code = parseInt(line.substring(0, 3), 10);
+        const is_continuation = line[3] === "-";
+        if (!is_continuation) { handle_smtp_response_line(code, line); }
+      }
+    }
+
+    function send_smtp_command(cmd: string): void {
+      socket.write(cmd + "\r\n");
+    }
+
+    function handle_smtp_response_line(code: number, line: string): void {
+      if (phase === "greeting") {
+        if (code !== 220) { return reject(new NetworkError(`SMTP greeting failed: ${line}`)); }
+        phase = "ehlo";
+        send_smtp_command("EHLO oneid-sdk");
+      } else if (phase === "ehlo") {
+        if (code !== 250) { return reject(new NetworkError(`SMTP EHLO failed: ${line}`)); }
+        phase = "auth";
+        const auth_string = Buffer.from(`\x00${auth_email}\x00${auth_password}`).toString("base64");
+        send_smtp_command(`AUTH PLAIN ${auth_string}`);
+      } else if (phase === "auth") {
+        if (code !== 235) { return reject(new AuthenticationError(`SMTP authentication failed: ${line}`)); }
+        phase = "mail_from";
+        send_smtp_command(`MAIL FROM:<${envelope_from}>`);
+      } else if (phase === "mail_from") {
+        if (code !== 250) { return reject(new NetworkError(`SMTP MAIL FROM failed: ${line}`)); }
+        phase = "rcpt_to";
+        command_queue = [...envelope_to_list];
+        send_smtp_command(`RCPT TO:<${command_queue.shift()!}>`);
+      } else if (phase === "rcpt_to") {
+        if (code !== 250) { return reject(new NetworkError(`SMTP RCPT TO failed: ${line}`)); }
+        if (command_queue.length > 0) {
+          send_smtp_command(`RCPT TO:<${command_queue.shift()!}>`);
+        } else {
+          phase = "data_cmd";
+          send_smtp_command("DATA");
+        }
+      } else if (phase === "data_cmd") {
+        if (code !== 354) { return reject(new NetworkError(`SMTP DATA command failed: ${line}`)); }
+        phase = "data_done";
+        socket.write(message_bytes);
+        socket.write(Buffer.from("\r\n.\r\n"));
+      } else if (phase === "data_done") {
+        if (code !== 250) { return reject(new NetworkError(`SMTP message rejected: ${line}`)); }
+        phase = "quit";
+        send_smtp_command("QUIT");
+      } else if (phase === "quit") {
+        socket.destroy();
+        resolve();
+      }
+    }
+
+    socket.on("data", on_smtp_data);
+    socket.on("error", (err: Error) => {
+      reject(new NetworkError(`SMTP connection error: ${err.message}`));
+    });
+    socket.on("timeout", () => {
+      socket.destroy();
+      reject(new NetworkError("SMTP connection timed out"));
+    });
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// DNS MX discovery for smtp_domain
+// ---------------------------------------------------------------------------
+
+function _discover_smtp_submission_host_via_mx_lookup(
+  domain_name: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    dns.resolveMx(domain_name, (err: NodeJS.ErrnoException | null, addresses: dns.MxRecord[] | undefined) => {
+      if (err || !addresses || addresses.length === 0) {
+        return reject(new NetworkError(
+          `MX lookup failed for domain '${domain_name}': ${err?.message ?? "no MX records found"}. ` +
+          `Use smtp_host to specify the SMTP server directly.`
+        ));
+      }
+      addresses.sort((a: dns.MxRecord, b: dns.MxRecord) => a.priority - b.priority);
+      resolve(addresses[0].exchange);
+    });
+  });
+}
+
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -688,13 +900,17 @@ export async function send(options: SendOptions): Promise<SendResult> {
     smtp_port = null,
     smtp_username = null,
     smtp_password = null,
+    smtp_domain = null,
+    smtp_security = null,
+    smtp_envelope_from = null,
+    deliver = true,
   } = options;
 
   const creds = load_credentials();
 
   const effective_smtp_auth_username = smtp_username ?? creds.mailpal_email ?? `${creds.client_id}@mailpal.com`;
   const effective_smtp_auth_password = smtp_password ?? creds.mailpal_app_password;
-  if (!effective_smtp_auth_password) {
+  if (deliver && !effective_smtp_auth_password) {
     throw new NotEnrolledError(
       "No SMTP password available. Either pass smtp_password explicitly, " +
       "or call mailpal.activate() first to store SMTP credentials, " +
@@ -826,9 +1042,38 @@ export async function send(options: SendOptions): Promise<SendResult> {
     wire_format_message_bytes, attestation_header_lines_to_inject,
   );
 
-  // -- Phase 6: Submit via SMTP with STARTTLS --
-  const effective_smtp_host = smtp_host ?? _SMTP_HOST;
-  const effective_smtp_port = smtp_port ?? _SMTP_PORT_STARTTLS;
+  // -- Phase 6: Deliver via SMTP or return raw bytes --
+  if (!deliver) {
+    return {
+      message_id,
+      from_address: effective_from_email,
+      attestation_headers_included: mode2_sd_jwt_proof != null || mode1_direct_attestation_proof != null,
+      contact_token_header_included: mode2_sd_jwt_proof?.contact_token != null,
+      sd_jwt_header_included: mode2_sd_jwt_proof?.sd_jwt != null,
+      direct_attestation_header_included: mode1_direct_attestation_proof?.hardware_attestation_header_value != null,
+      rfc5322_message_bytes: final_message_bytes,
+    };
+  }
+
+  const effective_security_mode = smtp_security ?? "starttls";
+
+  let effective_smtp_host: string;
+  if (smtp_host) {
+    effective_smtp_host = smtp_host;
+  } else if (smtp_domain) {
+    effective_smtp_host = await _discover_smtp_submission_host_via_mx_lookup(smtp_domain);
+  } else {
+    effective_smtp_host = _SMTP_HOST;
+  }
+
+  const _DEFAULT_PORTS_BY_SECURITY_MODE: Record<string, number> = {
+    "starttls": 587,
+    "tls": 465,
+    "none": 25,
+  };
+  const effective_smtp_port = smtp_port ?? _DEFAULT_PORTS_BY_SECURITY_MODE[effective_security_mode] ?? 587;
+
+  const effective_envelope_from = smtp_envelope_from ?? effective_smtp_auth_username;
 
   const all_recipient_emails: string[] = [];
   for (const addr of to) { all_recipient_emails.push(_extract_bare_email_from_address_string(addr)); }
@@ -839,12 +1084,28 @@ export async function send(options: SendOptions): Promise<SendResult> {
     throw new Error("No valid recipient email addresses found in to/cc/bcc.");
   }
 
-  await _send_raw_message_via_smtp_with_starttls(
-    effective_smtp_host, effective_smtp_port,
-    effective_smtp_auth_username, effective_smtp_auth_password,
-    effective_from_email, all_recipient_emails,
-    final_message_bytes, _SMTP_TIMEOUT_MILLISECONDS,
-  );
+  if (effective_security_mode === "tls") {
+    await _send_raw_message_via_smtp_with_direct_tls(
+      effective_smtp_host, effective_smtp_port,
+      effective_smtp_auth_username, effective_smtp_auth_password!,
+      effective_envelope_from, all_recipient_emails,
+      final_message_bytes, _SMTP_TIMEOUT_MILLISECONDS,
+    );
+  } else if (effective_security_mode === "none") {
+    await _send_raw_message_via_plain_smtp_without_encryption(
+      effective_smtp_host, effective_smtp_port,
+      effective_smtp_auth_username, effective_smtp_auth_password!,
+      effective_envelope_from, all_recipient_emails,
+      final_message_bytes, _SMTP_TIMEOUT_MILLISECONDS,
+    );
+  } else {
+    await _send_raw_message_via_smtp_with_starttls(
+      effective_smtp_host, effective_smtp_port,
+      effective_smtp_auth_username, effective_smtp_auth_password!,
+      effective_envelope_from, all_recipient_emails,
+      final_message_bytes, _SMTP_TIMEOUT_MILLISECONDS,
+    );
+  }
 
   return {
     message_id,
