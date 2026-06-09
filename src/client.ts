@@ -159,6 +159,7 @@ export class OneIDAPIClient {
     key_algorithm: string,
     operator_email?: string | null,
     requested_handle?: string | null,
+    display_name?: string | null,
   ): Promise<Record<string, unknown>> {
     const request_body: Record<string, unknown> = {
       software_key_pem,
@@ -166,6 +167,7 @@ export class OneIDAPIClient {
     };
     if (operator_email != null) { request_body["operator_email"] = operator_email; }
     if (requested_handle != null) { request_body["requested_handle"] = requested_handle; }
+    if (display_name != null) { request_body["display_name"] = display_name; }
 
     return this._make_request("POST", "/api/v1/enroll/declared", request_body);
   }
@@ -257,6 +259,63 @@ export class OneIDAPIClient {
   ): Promise<Record<string, unknown>> {
     return this._make_request("POST", "/api/v1/enroll/activate", {
       enrollment_session_id,
+      decrypted_credential,
+    });
+  }
+
+  /**
+   * Begin TPM-based identity recovery when credentials.json is lost
+   * but the machine still has its original TPM. The server creates a
+   * MakeCredential challenge to prove hardware possession and recover
+   * the existing identity's credentials.
+   */
+  async recover_begin(
+    ek_certificate_pem: string,
+    ak_public_key_pem: string,
+    ak_tpmt_public_b64: string = "",
+    ek_public_key_pem: string = "",
+    ek_certificate_chain_pem?: string[],
+  ): Promise<Record<string, unknown>> {
+    const request_body: Record<string, unknown> = {
+      ek_certificate_pem,
+      ak_public_key_pem,
+      ak_tpmt_public_b64,
+    };
+    if (ek_public_key_pem) { request_body["ek_public_key_pem"] = ek_public_key_pem; }
+    if (ek_certificate_chain_pem) { request_body["ek_certificate_chain_pem"] = ek_certificate_chain_pem; }
+
+    return this._make_request("POST", "/api/v1/enroll/recover", request_body);
+  }
+
+  /**
+   * Begin PIV-based identity recovery when credentials.json is lost
+   * but the user still has their YubiKey/PIV device.
+   */
+  async recover_begin_piv(
+    attestation_cert_pem: string,
+    attestation_chain_pem: string[],
+    signing_key_public_pem: string,
+    hsm_type: string = "yubikey",
+  ): Promise<Record<string, unknown>> {
+    return this._make_request("POST", "/api/v1/enroll/recover/piv", {
+      hsm_type,
+      attestation_cert_pem,
+      attestation_chain_pem,
+      signing_key_public_pem,
+    });
+  }
+
+  /**
+   * Complete identity recovery by proving hardware possession.
+   * Returns fresh credentials (rotated client_secret) for the
+   * recovered identity.
+   */
+  async recover_activate(
+    recovery_session_id: string,
+    decrypted_credential: string,
+  ): Promise<Record<string, unknown>> {
+    return this._make_request("POST", "/api/v1/enroll/recover/activate", {
+      enrollment_session_id: recovery_session_id,
       decrypted_credential,
     });
   }

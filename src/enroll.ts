@@ -24,9 +24,11 @@ import { OneIDAPIClient } from "./client.js";
 import {
   DEFAULT_API_BASE_URL,
   type StoredCredentials,
+  credentials_exist,
+  load_credentials,
   save_credentials,
 } from "./credentials.js";
-import { EnrollmentError, NoHSMError } from "./exceptions.js";
+import { AlreadyEnrolledError, EnrollmentError, NoHSMError } from "./exceptions.js";
 import {
   DEFAULT_KEY_ALGORITHM,
   HSMType,
@@ -157,6 +159,19 @@ export interface EnrollOptions {
  * If request_tier is specified, you get exactly that tier or an exception.
  */
 export async function enroll(options?: EnrollOptions): Promise<Identity> {
+  if (credentials_exist()) {
+    const existing_credentials = load_credentials();
+    throw new AlreadyEnrolledError(
+      `You already have a 1ID identity: '${existing_credentials.client_id}' ` +
+      `(trust tier: ${existing_credentials.trust_tier}). ` +
+      `Your identity is ready to use right now:\n` +
+      `  const id = oneid.whoami()            // local, no network\n` +
+      `  const token = await oneid.getToken()  // OAuth2 Bearer token\n` +
+      `  const world = await oneid.status()    // full picture from server\n` +
+      `Creating a second identity on the same machine is not supported.`
+    );
+  }
+
   const effective_options = options ?? {};
   const api_base_url = effective_options.api_base_url ?? DEFAULT_API_BASE_URL;
   const display_name = effective_options.display_name ?? null;
@@ -249,8 +264,12 @@ async function enroll_with_auto_detected_best_tier(
         console.log(`[oneid] Tier ${candidate_tier} not available (no compatible hardware), trying next...`);
         continue;
       }
+      if (error instanceof AlreadyEnrolledError) {
+        throw error;
+      }
       if (candidate_tier === TrustTier.DECLARED) { throw error; }
-      console.log(`[oneid] Tier ${candidate_tier} failed, trying next...`);
+      const error_detail = error instanceof Error ? error.message : String(error);
+      console.log(`[oneid] Tier ${candidate_tier} failed (${error_detail}), trying next...`);
       continue;
     }
   }
@@ -281,6 +300,7 @@ async function enroll_declared_tier(
     key_algorithm,
     operator_email,
     requested_handle,
+    display_name,
   );
 
   // Step 3: Parse server response
@@ -375,24 +395,59 @@ async function enroll_piv_tier(
   const attestation_data = await extract_attestation_data(selected_hsm);
 
   const api_client = new OneIDAPIClient(api_base_url);
-  const begin_response = await api_client.enroll_begin_piv(
-    attestation_data.attestation_cert_pem as string,
-    (attestation_data.attestation_chain_pem as string[]) ?? [],
-    attestation_data.signing_key_public_pem as string,
-    (selected_hsm.type as string) ?? "yubikey",
-    operator_email,
-    requested_handle,
-  );
+  let begin_response: Record<string, unknown>;
+  let this_is_a_piv_recovery_not_a_new_enrollment = false;
+
+  try {
+    begin_response = await api_client.enroll_begin_piv(
+      attestation_data.attestation_cert_pem as string,
+      (attestation_data.attestation_chain_pem as string[]) ?? [],
+      attestation_data.signing_key_public_pem as string,
+      (selected_hsm.type as string) ?? "yubikey",
+      operator_email,
+      requested_handle,
+    );
+  } catch (enroll_begin_piv_error) {
+    if (enroll_begin_piv_error instanceof AlreadyEnrolledError) {
+      console.log(
+        "[oneid] PIV device already registered -- attempting identity recovery. " +
+        "The YubiKey IS the identity; re-presenting it recovers credentials."
+      );
+      begin_response = await api_client.recover_begin_piv(
+        attestation_data.attestation_cert_pem as string,
+        (attestation_data.attestation_chain_pem as string[]) ?? [],
+        attestation_data.signing_key_public_pem as string,
+        (selected_hsm.type as string) ?? "yubikey",
+      );
+      this_is_a_piv_recovery_not_a_new_enrollment = true;
+    } else {
+      throw enroll_begin_piv_error;
+    }
+  }
 
   const nonce_challenge_b64 = begin_response.nonce_challenge as string;
 
   const sign_result = await sign_challenge_with_piv(nonce_challenge_b64);
   const signed_nonce_b64 = sign_result.signature_b64 as string;
 
-  const activate_response = await api_client.enroll_activate(
-    begin_response.enrollment_session_id as string,
-    signed_nonce_b64,
-  );
+  const session_id_field = this_is_a_piv_recovery_not_a_new_enrollment
+    ? "recovery_session_id" : "enrollment_session_id";
+
+  let activate_response: Record<string, unknown>;
+  if (this_is_a_piv_recovery_not_a_new_enrollment) {
+    activate_response = await api_client.recover_activate(
+      begin_response[session_id_field] as string,
+      signed_nonce_b64,
+    );
+    console.log(
+      `[oneid] Identity recovered via PIV: ${((activate_response.identity as Record<string, unknown>)?.agent_id as string) ?? "unknown"}`
+    );
+  } else {
+    activate_response = await api_client.enroll_activate(
+      begin_response[session_id_field] as string,
+      signed_nonce_b64,
+    );
+  }
 
   const identity_data = (activate_response.identity ?? {}) as Record<string, unknown>;
   const credentials_data = (activate_response.credentials ?? {}) as Record<string, unknown>;
@@ -608,20 +663,44 @@ async function enroll_hsm_tier(
   // Step 3: Extract attestation (requires elevation)
   const attestation_data = await extract_attestation_data(selected_hsm);
 
-  // Step 4: Begin enrollment with server
+  // Step 4: Begin enrollment with server (or recover if EK is already registered)
   const api_client = new OneIDAPIClient(api_base_url);
-  const begin_response = await api_client.enroll_begin(
-    attestation_data.ek_cert_pem as string,
-    (attestation_data.ak_public_pem as string) ?? "",
-    (attestation_data.ak_tpmt_public_b64 as string) ?? "",
-    (attestation_data.ek_public_pem as string) ?? "",
-    (attestation_data.chain_pem as string[]) ?? undefined,
-    (selected_hsm.type as string) ?? "tpm",
-    operator_email,
-    requested_handle,
-  );
+  let begin_response: Record<string, unknown>;
+  let this_is_a_recovery_not_a_new_enrollment = false;
+
+  try {
+    begin_response = await api_client.enroll_begin(
+      attestation_data.ek_cert_pem as string,
+      (attestation_data.ak_public_pem as string) ?? "",
+      (attestation_data.ak_tpmt_public_b64 as string) ?? "",
+      (attestation_data.ek_public_pem as string) ?? "",
+      (attestation_data.chain_pem as string[]) ?? undefined,
+      (selected_hsm.type as string) ?? "tpm",
+      operator_email,
+      requested_handle,
+    );
+  } catch (enroll_begin_error) {
+    if (enroll_begin_error instanceof AlreadyEnrolledError) {
+      console.log(
+        "[oneid] Hardware already registered -- attempting identity recovery. " +
+        "The hardware IS the identity; proving TPM possession recovers credentials."
+      );
+      begin_response = await api_client.recover_begin(
+        attestation_data.ek_cert_pem as string,
+        (attestation_data.ak_public_pem as string) ?? "",
+        (attestation_data.ak_tpmt_public_b64 as string) ?? "",
+        (attestation_data.ek_public_pem as string) ?? "",
+        (attestation_data.chain_pem as string[]) ?? undefined,
+      );
+      this_is_a_recovery_not_a_new_enrollment = true;
+    } else {
+      throw enroll_begin_error;
+    }
+  }
 
   // Step 5: Activate credential via TPM (requires elevation)
+  const session_id_field = this_is_a_recovery_not_a_new_enrollment
+    ? "recovery_session_id" : "enrollment_session_id";
   const decrypted_credential = await activate_credential(
     selected_hsm,
     begin_response.credential_blob as string,
@@ -629,11 +708,23 @@ async function enroll_hsm_tier(
     (attestation_data.ak_handle as string) ?? "0x81000100",
   );
 
-  // Step 6: Complete enrollment with server
-  const activate_response = await api_client.enroll_activate(
-    begin_response.enrollment_session_id as string,
-    decrypted_credential,
-  );
+  // Step 6: Complete enrollment (or recovery) with server
+  let activate_response: Record<string, unknown>;
+  if (this_is_a_recovery_not_a_new_enrollment) {
+    activate_response = await api_client.recover_activate(
+      begin_response[session_id_field] as string,
+      decrypted_credential,
+    );
+    console.log(
+      `[oneid] Identity recovered: ${((activate_response.identity as Record<string, unknown>)?.agent_id as string) ?? "unknown"} ` +
+      "(the hardware proved it is the same machine)"
+    );
+  } else {
+    activate_response = await api_client.enroll_activate(
+      begin_response[session_id_field] as string,
+      decrypted_credential,
+    );
+  }
 
   // Step 7: Store credentials and return Identity
   const identity_data = (activate_response.identity ?? {}) as Record<string, unknown>;
