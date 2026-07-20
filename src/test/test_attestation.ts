@@ -160,7 +160,11 @@ describe("canonicalise_headers_for_message_binding", () => {
     assert.equal(htp_occurrences, 1, "Hardware-Trust-Proof should appear exactly once (appended)");
   });
 
-  it("sorts extra headers alphabetically after the required five", () => {
+  it("covers EXACTLY the fixed five headers (email-03) and ignores extras", () => {
+    // email-03 Mode 2: the covered set is fixed at From, To, Subject,
+    // Date, Message-ID -- extra headers are NOT covered (no negotiation,
+    // no explicit h= list), so an injected header must not appear in the
+    // nonce input. This is stronger than the old "sort extras" behavior.
     const headers_with_extras = {
       ..._SAMPLE_EMAIL_HEADERS,
       "X-Zebra": "last-extra",
@@ -168,11 +172,14 @@ describe("canonicalise_headers_for_message_binding", () => {
     };
     const result = canonicalise_headers_for_message_binding(headers_with_extras);
     const decoded = result.toString("utf-8");
-    const alpha_position = decoded.indexOf("x-alpha:");
-    const zebra_position = decoded.indexOf("x-zebra:");
-    assert.ok(alpha_position < zebra_position, "x-alpha should come before x-zebra");
-    const htp_position = decoded.indexOf("hardware-trust-proof:");
-    assert.ok(zebra_position < htp_position, "extras should come before hardware-trust-proof");
+    assert.equal(decoded.indexOf("x-alpha:"), -1, "extras must NOT be covered");
+    assert.equal(decoded.indexOf("x-zebra:"), -1, "extras must NOT be covered");
+    // the fixed five, each once, then the trailing hardware-trust-proof:
+    for (const name of ["from:", "to:", "subject:", "date:", "message-id:"]) {
+      assert.ok(decoded.indexOf(name) >= 0, `${name} must be covered`);
+    }
+    assert.ok(decoded.trimEnd().endsWith("hardware-trust-proof:"),
+      "must end with the self-referencing hardware-trust-proof line");
   });
 
   it("is case-insensitive for input header keys", () => {

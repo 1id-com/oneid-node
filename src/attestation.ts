@@ -111,17 +111,15 @@ export function canonicalise_headers_for_message_binding(
     }
   }
 
-  const header_names_for_nonce: string[] = [..._MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING];
-  header_names_for_nonce.push(..._MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING);
-
-  const message_header_pairs: Array<[string, string]> = Object.entries(lowered_headers);
-  const selected = _select_headers_bottom_up_per_dkim(header_names_for_nonce, message_header_pairs);
-
+  // email-03 Mode 2 covers a FIXED set: exactly From, To, Subject, Date,
+  // Message-ID, in THAT order, each once -- no oversigning, no bottom-up
+  // selection (Mode 2 carries no explicit h= list, so its covered set
+  // must be fixed and known to both sides).
   const canonicalised_header_lines: string[] = [];
-  for (const entry of selected) {
-    if (entry === null) { continue; }
-    const canon_name = canonicalise_header_name_using_dkim_relaxed(entry[0]);
-    const canon_value = canonicalise_header_value_using_dkim_relaxed(entry[1]);
+  for (const required_header_name of _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING) {
+    const canon_name = canonicalise_header_name_using_dkim_relaxed(required_header_name);
+    const canon_value = canonicalise_header_value_using_dkim_relaxed(
+      lowered_headers[required_header_name]);
     canonicalised_header_lines.push(`${canon_name}:${canon_value}\r\n`);
   }
 
