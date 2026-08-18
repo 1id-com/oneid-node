@@ -73,7 +73,7 @@ async function command_whoami(args: string[]): Promise<number> {
   try {
     const credentials = load_credentials();
     const info = {
-      internal_id: credentials.client_id,
+      canonical_id: credentials.client_id,
       trust_tier: credentials.trust_tier,
       key_algorithm: credentials.key_algorithm,
       enrolled_at: credentials.enrolled_at || null,
@@ -82,7 +82,7 @@ async function command_whoami(args: string[]): Promise<number> {
     if (output_as_json) {
       console.log(JSON.stringify(info, null, 2));
     } else {
-      console.log(`Identity:   ${info.internal_id}`);
+      console.log(`Identity:   ${info.canonical_id}`);
       console.log(`Trust tier: ${info.trust_tier}`);
       console.log(`Algorithm:  ${info.key_algorithm}`);
       if (info.enrolled_at) {
@@ -148,7 +148,7 @@ async function command_enroll(args: string[]): Promise<number> {
     });
 
     console.log("Enrolled successfully!");
-    console.log(`Identity:   ${identity.internal_id}`);
+    console.log(`Identity:   ${identity.canonical_id}`);
     console.log(`Handle:     ${identity.handle}`);
     console.log(`Trust tier: ${identity.trust_tier}`);
     return 0;

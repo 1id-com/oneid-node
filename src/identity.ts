@@ -8,7 +8,7 @@
 /**
  * Trust tiers assigned by 1id.com based on hardware attestation.
  *
- * RFC: draft-drake-email-hardware-attestation-00 Section 3.
+ * RFC: draft-drake-email-hardware-attestation-03 Section 3.
  *
  * Ordered from highest to lowest Sybil resistance:
  * - sovereign (TPM): Non-portable discrete/firmware TPM, manufacturer CA chain verifiable
@@ -58,9 +58,9 @@ export enum HSMType {
  * Returned by enroll() and whoami(). All fields are readonly.
  */
 export interface Identity {
-  /** Permanent unique identifier (e.g., '1id-a7b3c9d2'). Never changes. */
-  readonly internal_id: string;
-  /** Handle (e.g., '@clawdia' or '@1id-a7b3c9d2'). */
+  /** Permanent unique identifier (e.g., 'id-xpwsb-rqgdz-vctkm-nfjhx'). Never changes. */
+  readonly canonical_id: string;
+  /** Handle (e.g., '@clawdia' or '@id-xpwsb-rqgdz-vctkm-nfjhx'). */
   readonly handle: string;
   /** The trust level assigned based on hardware attestation. */
   readonly trust_tier: TrustTier;
@@ -74,7 +74,7 @@ export interface Identity {
   readonly device_count: number;
   /** The key algorithm used for this identity's signing key. */
   readonly key_algorithm: KeyAlgorithm;
-  /** Agent Identity URN (e.g., 'urn:aid:1id.com:1id-a7b3c9d2'), or null if not yet assigned. */
+  /** Agent Identity URN (e.g., 'urn:aid:global:id-xpwsb-rqgdz-vctkm-nfjhx'), or null if not yet assigned. */
   readonly agent_identity_urn: string | null;
   /** Friendly name chosen by the agent (e.g., "Clawdia", "Sparky"). */
   readonly display_name: string | null;
@@ -122,5 +122,5 @@ export function format_authorization_header_value(token: Token): string {
 export function format_identity_as_display_string(identity: Identity): string {
   const name_part = identity.display_name ? ` (${identity.display_name})` : "";
   const urn_part = identity.agent_identity_urn ? `, urn: ${identity.agent_identity_urn}` : "";
-  return `${identity.handle}${name_part} (tier: ${identity.trust_tier}, id: ${identity.internal_id}${urn_part})`;
+  return `${identity.handle}${name_part} (tier: ${identity.trust_tier}, id: ${identity.canonical_id}${urn_part})`;
 }

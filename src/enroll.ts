@@ -307,14 +307,14 @@ async function enroll_declared_tier(
   const identity_data = (server_response.identity ?? {}) as Record<string, unknown>;
   const credentials_data = (server_response.credentials ?? {}) as Record<string, unknown>;
 
-  const internal_id = (identity_data.agent_id as string) ?? (identity_data.internal_id as string) ?? "";
+  const canonical_id = (identity_data.agent_id as string) ?? (identity_data.canonical_id as string) ?? "";
   const agent_identity_urn = (identity_data.agent_identity_urn as string) ?? "";
-  const handle = (identity_data.handle as string) ?? `@${internal_id.slice(0, 12)}`;
+  const handle = (identity_data.handle as string) ?? `@${canonical_id}`;
   const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
 
   // Step 4: Store credentials locally
   const stored_credentials: StoredCredentials = {
-    client_id: (credentials_data.client_id as string) ?? internal_id,
+    client_id: (credentials_data.client_id as string) ?? canonical_id,
     client_secret: (credentials_data.client_secret as string) ?? "",
     token_endpoint: (credentials_data.token_endpoint as string) ??
       `${api_base_url}/realms/agents/protocol/openid-connect/token`,
@@ -337,7 +337,7 @@ async function enroll_declared_tier(
   }
 
   return {
-    internal_id,
+    canonical_id,
     handle,
     trust_tier: TrustTier.DECLARED,
     hsm_type: HSMType.SOFTWARE,
@@ -452,14 +452,14 @@ async function enroll_piv_tier(
   const identity_data = (activate_response.identity ?? {}) as Record<string, unknown>;
   const credentials_data = (activate_response.credentials ?? {}) as Record<string, unknown>;
 
-  const internal_id = (identity_data.agent_id as string) ?? (identity_data.internal_id as string) ?? "";
+  const canonical_id = (identity_data.agent_id as string) ?? (identity_data.canonical_id as string) ?? "";
   const agent_identity_urn = (identity_data.agent_identity_urn as string) ?? "";
-  const handle = (identity_data.handle as string) ?? `@${internal_id.slice(0, 12)}`;
+  const handle = (identity_data.handle as string) ?? `@${canonical_id}`;
   const trust_tier_str = (identity_data.trust_tier as string) ?? request_tier;
   const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
 
   const stored_credentials: StoredCredentials = {
-    client_id: (credentials_data.client_id as string) ?? internal_id,
+    client_id: (credentials_data.client_id as string) ?? canonical_id,
     client_secret: (credentials_data.client_secret as string) ?? "",
     token_endpoint: (credentials_data.token_endpoint as string) ??
       `${api_base_url}/realms/agents/protocol/openid-connect/token`,
@@ -498,7 +498,7 @@ async function enroll_piv_tier(
   }
 
   return {
-    internal_id,
+    canonical_id,
     handle,
     trust_tier,
     hsm_type,
@@ -582,9 +582,9 @@ async function enroll_enclave_tier(
   const identity_data = (activate_response["identity"] ?? {}) as Record<string, unknown>;
   const credentials_data = (activate_response["credentials"] ?? {}) as Record<string, unknown>;
 
-  const internal_id = (identity_data["agent_id"] ?? identity_data["internal_id"] ?? "") as string;
+  const canonical_id = (identity_data["agent_id"] ?? identity_data["canonical_id"] ?? "") as string;
   const agent_identity_urn = (identity_data["agent_identity_urn"] ?? "") as string;
-  const handle = (identity_data["handle"] ?? `@${internal_id.slice(0, 12)}`) as string;
+  const handle = (identity_data["handle"] ?? `@${canonical_id}`) as string;
   const trust_tier_str = (identity_data["trust_tier"] ?? "enclave") as string;
   const enrolled_at_str = (identity_data["registered_at"] ?? new Date().toISOString()) as string;
 
@@ -598,7 +598,7 @@ async function enroll_enclave_tier(
   }
 
   const stored_credentials: StoredCredentials = {
-    client_id: (credentials_data["client_id"] ?? internal_id) as string,
+    client_id: (credentials_data["client_id"] ?? canonical_id) as string,
     client_secret: (credentials_data["client_secret"] ?? "") as string,
     token_endpoint: (credentials_data["token_endpoint"] ?? `${api_base_url}/realms/agents/protocol/openid-connect/token`) as string,
     api_base_url,
@@ -614,7 +614,7 @@ async function enroll_enclave_tier(
   await save_credentials(stored_credentials);
 
   return {
-    internal_id,
+    canonical_id,
     handle,
     trust_tier: TrustTier.ENCLAVE,
     hsm_type: HSMType.SECURE_ENCLAVE,
@@ -730,14 +730,14 @@ async function enroll_hsm_tier(
   const identity_data = (activate_response.identity ?? {}) as Record<string, unknown>;
   const credentials_data = (activate_response.credentials ?? {}) as Record<string, unknown>;
 
-  const internal_id = (identity_data.agent_id as string) ?? (identity_data.internal_id as string) ?? "";
+  const canonical_id = (identity_data.agent_id as string) ?? (identity_data.canonical_id as string) ?? "";
   const agent_identity_urn = (identity_data.agent_identity_urn as string) ?? "";
-  const handle = (identity_data.handle as string) ?? `@${internal_id.slice(0, 12)}`;
+  const handle = (identity_data.handle as string) ?? `@${canonical_id}`;
   const trust_tier_str = (identity_data.trust_tier as string) ?? request_tier;
   const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
 
   const stored_credentials: StoredCredentials = {
-    client_id: (credentials_data.client_id as string) ?? internal_id,
+    client_id: (credentials_data.client_id as string) ?? canonical_id,
     client_secret: (credentials_data.client_secret as string) ?? "",
     token_endpoint: (credentials_data.token_endpoint as string) ??
       `${api_base_url}/realms/agents/protocol/openid-connect/token`,
@@ -776,7 +776,7 @@ async function enroll_hsm_tier(
   }
 
   return {
-    internal_id,
+    canonical_id,
     handle,
     trust_tier,
     hsm_type,

@@ -143,7 +143,7 @@ describe("Credential storage (offline)", () => {
 
   it("should save and load credentials", () => {
     const test_credentials: StoredCredentials = {
-      client_id: "1id-test1234",
+      client_id: "id-xpwsb-rqgdz-vctkm-nfjhx",
       client_secret: "secret_abc123",
       token_endpoint: "https://1id.com/realms/agents/protocol/openid-connect/token",
       api_base_url: "https://1id.com",
@@ -157,7 +157,7 @@ describe("Credential storage (offline)", () => {
     assert.ok(credentials_exist(), "credentials should exist after save");
 
     const loaded = load_credentials();
-    assert.equal(loaded.client_id, "1id-test1234");
+    assert.equal(loaded.client_id, "id-xpwsb-rqgdz-vctkm-nfjhx");
     assert.equal(loaded.client_secret, "secret_abc123");
     assert.equal(loaded.trust_tier, "declared");
     assert.equal(loaded.key_algorithm, "ed25519");
@@ -167,8 +167,8 @@ describe("Credential storage (offline)", () => {
   it("should handle whoami() with saved credentials", () => {
     // Credentials from previous test should still exist
     const identity = whoami();
-    assert.equal(identity.internal_id, "1id-test1234");
-    assert.equal(identity.handle, "@1id-test1234");
+    assert.equal(identity.canonical_id, "id-xpwsb-rqgdz-vctkm-nfjhx");
+    assert.equal(identity.handle, "@id-xpwsb-rqgdz-vctkm-nfjhx");
     assert.equal(identity.trust_tier, TrustTier.DECLARED);
     assert.equal(identity.hsm_type, HSMType.SOFTWARE);
     assert.equal(identity.key_algorithm, KeyAlgorithm.ED25519);
@@ -298,8 +298,8 @@ describe("Live declared-tier enrollment (requires server)", () => {
     }
 
     // Verify the identity object
-    assert.ok(identity.internal_id, "internal_id should be non-empty");
-    assert.ok(identity.internal_id.startsWith("1id_"), `internal_id should start with '1id_', got: ${identity.internal_id}`);
+    assert.ok(identity.canonical_id, "canonical_id should be non-empty");
+    assert.ok(identity.canonical_id.startsWith("id-"), `canonical_id should start with 'id-', got: ${identity.canonical_id}`);
     assert.ok(identity.handle, "handle should be non-empty");
     assert.ok(identity.handle.startsWith("@"), `handle should start with '@', got: ${identity.handle}`);
     assert.equal(identity.trust_tier, TrustTier.DECLARED);
@@ -308,13 +308,13 @@ describe("Live declared-tier enrollment (requires server)", () => {
     assert.ok(identity.enrolled_at instanceof Date, "enrolled_at should be a Date");
     assert.equal(identity.device_count, 0, "declared tier should have device_count 0");
 
-    console.log(`  Enrolled: ${identity.handle} (${identity.internal_id})`);
+    console.log(`  Enrolled: ${identity.handle} (${identity.canonical_id})`);
     console.log(`  Trust tier: ${identity.trust_tier}`);
     console.log(`  Key algorithm: ${identity.key_algorithm}`);
 
     // Verify whoami works with the live enrollment
     const me = whoami();
-    assert.ok(me.internal_id.startsWith("1id_"));
+    assert.ok(me.canonical_id.startsWith("id-"));
     assert.equal(me.trust_tier, TrustTier.DECLARED);
     console.log(`  whoami(): ${me.handle}`);
   });

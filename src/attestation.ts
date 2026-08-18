@@ -11,7 +11,7 @@
  *      body: Buffer.from("Message body"),
  *    });
  *    ```
- *    The nonce is computed per draft-drake-email-hardware-attestation-00
+ *    The nonce is computed per draft-drake-email-hardware-attestation-03
  *    Section 5.3 using DKIM relaxed header canonicalization and a
  *    header+body+timestamp binding.
  *
@@ -21,7 +21,7 @@
  *    ```
  *    The nonce is base64url(SHA-256(content)). Suitable for non-email protocols.
  *
- * RFC: draft-drake-email-hardware-attestation-00 Section 5.
+ * RFC: draft-drake-email-hardware-attestation-03 Section 5.
  * Nonce algorithm: Section 5.3 (message-binding via issuer-signed nonce).
  */
 
@@ -221,7 +221,7 @@ export function canonicalise_headers_for_direct_attestation(
   return Buffer.from(canonicalised_header_lines.join(""), "utf-8");
 }
 
-export function compute_attestation_digest_for_direct_mode(
+export function compute_attestation_input_for_direct_mode(
   email_headers: Record<string, string>,
   body_bytes: Buffer,
   attestation_timestamp_unix: number,
@@ -238,8 +238,7 @@ export function compute_attestation_digest_for_direct_mode(
   const ts_bytes = Buffer.alloc(8);
   ts_bytes.writeBigUInt64BE(BigInt(attestation_timestamp_unix));
 
-  const attestation_input = Buffer.concat([h_hash, bh_raw, ts_bytes]);
-  return createHash("sha256").update(attestation_input).digest();
+  return Buffer.concat([h_hash, bh_raw, ts_bytes]);
 }
 
 function der_encode_length(length_value: number): Buffer {
@@ -467,26 +466,26 @@ export async function prepare_direct_hardware_attestation(
     header_template_without_chain += `; aid=${agent_identity_urn}`;
   }
 
-  const attestation_digest = compute_attestation_digest_for_direct_mode(
+  const attestation_input_72_bytes = compute_attestation_input_for_direct_mode(
     email_headers, body, attestation_timestamp, header_template_without_chain,
   );
 
   let signature_bytes: Buffer;
   if (trust_tier === "portable") {
     const { sign_challenge_with_piv } = await import("./helper.js");
-    const result = await sign_challenge_with_piv(attestation_digest.toString("base64"));
+    const result = await sign_challenge_with_piv(attestation_input_72_bytes.toString("base64"));
     signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
   } else if (trust_tier === "enclave") {
     const { sign_challenge_with_enclave } = await import("./helper.js");
-    const result = await sign_challenge_with_enclave(attestation_digest.toString("base64"));
+    const result = await sign_challenge_with_enclave(attestation_input_72_bytes.toString("base64"));
     signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
   } else if (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") {
     const { sign_challenge_with_tpm } = await import("./helper.js");
-    const result = await sign_challenge_with_tpm(attestation_digest.toString("base64"), creds.hsm_key_reference ?? "");
+    const result = await sign_challenge_with_tpm(attestation_input_72_bytes.toString("base64"), creds.hsm_key_reference ?? "");
     signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
   } else if (creds.private_key_pem) {
     const { sign_challenge_with_private_key } = await import("./keys.js");
-    signature_bytes = sign_challenge_with_private_key(creds.private_key_pem, attestation_digest);
+    signature_bytes = sign_challenge_with_private_key(creds.private_key_pem, attestation_input_72_bytes);
   } else {
     throw new NotEnrolledError("No signing key available.");
   }

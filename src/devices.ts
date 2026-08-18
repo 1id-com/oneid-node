@@ -30,7 +30,7 @@ export interface DeviceInfo {
 }
 
 export interface DeviceListResult {
-  identity_internal_id: string;
+  canonical_id: string;
   total_device_count: number;
   active_device_count: number;
   burned_device_count: number;
@@ -38,7 +38,7 @@ export interface DeviceListResult {
 }
 
 export interface HardwareLockResult {
-  identity_internal_id: string;
+  canonical_id: string;
   hardware_locked: boolean;
   trust_tier: string;
   active_device_count: number;
@@ -111,7 +111,7 @@ export async function listDevices(
   const raw_devices = (response_data.devices ?? []) as Record<string, unknown>[];
 
   return {
-    identity_internal_id: (response_data.identity_internal_id ?? "") as string,
+    canonical_id: (response_data.canonical_id ?? response_data.identity_internal_id ?? "") as string,
     total_device_count: (response_data.total_devices ?? 0) as number,
     active_device_count: (response_data.active_devices ?? 0) as number,
     burned_device_count: (response_data.burned_devices ?? 0) as number,
@@ -167,7 +167,7 @@ export async function lockHardware(
   invalidate_world_cache();
 
   return {
-    identity_internal_id: (lock_data.identity_internal_id ?? "") as string,
+    canonical_id: (lock_data.canonical_id ?? lock_data.identity_internal_id ?? "") as string,
     hardware_locked: Boolean(lock_data.hardware_locked),
     trust_tier: (lock_data.trust_tier ?? "") as string,
     active_device_count: (lock_data.active_device_count ?? 1) as number,

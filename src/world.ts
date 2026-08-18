@@ -15,7 +15,7 @@ import { NotEnrolledError } from "./exceptions.js";
 const WORLD_CACHE_TTL_MILLISECONDS = 5 * 60 * 1000;
 
 export interface WorldIdentitySection {
-  internal_id: string;
+  canonical_id: string;
   handle: string;
   trust_tier: string;
   display_name: string | null;
@@ -138,7 +138,7 @@ function parse_world_response_to_world_status(data: Record<string, unknown>): Wo
   const raw_guidance = data.operator_guidance as Record<string, unknown> | null;
 
   const identity: WorldIdentitySection = {
-    internal_id: (raw_identity.internal_id ?? raw_identity.agent_id ?? "") as string,
+    canonical_id: (raw_identity.agent_id ?? raw_identity.canonical_id ?? "") as string,
     handle: (raw_identity.handle ?? "") as string,
     trust_tier: (raw_identity.trust_tier ?? "declared") as string,
     display_name: (raw_identity.display_name ?? null) as string | null,

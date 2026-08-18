@@ -77,7 +77,7 @@ import {
   canonicalise_body_using_dkim_simple,
   canonicalise_header_value_using_dkim_relaxed,
   canonicalise_header_name_using_dkim_relaxed,
-  compute_attestation_digest_for_direct_mode,
+  compute_attestation_input_for_direct_mode,
   build_cms_signed_data_for_direct_attestation,
   type AttestationProof,
   type PrepareAttestationOptions,
@@ -199,7 +199,7 @@ export {
   canonicalise_body_using_dkim_simple,
   canonicalise_header_value_using_dkim_relaxed,
   canonicalise_header_name_using_dkim_relaxed,
-  compute_attestation_digest_for_direct_mode,
+  compute_attestation_input_for_direct_mode,
   build_cms_signed_data_for_direct_attestation,
   type AttestationProof,
   type PrepareAttestationOptions,
@@ -266,8 +266,8 @@ export function whoami(): Identity {
     enrolled_at = new Date();
   }
 
-  const internal_id = creds.client_id;
-  const handle = internal_id.startsWith("@") ? internal_id : `@${internal_id}`;
+  const canonical_id = creds.client_id;
+  const handle = canonical_id.startsWith("@") ? canonical_id : `@${canonical_id}`;
 
   // Determine HSM type from credentials
   let hsm_type: HSMType | null = null;
@@ -278,7 +278,7 @@ export function whoami(): Identity {
   }
 
   return {
-    internal_id,
+    canonical_id,
     handle,
     trust_tier,
     hsm_type,
@@ -444,7 +444,7 @@ const oneid = {
   canonicalise_body_using_dkim_simple,
   canonicalise_header_value_using_dkim_relaxed,
   canonicalise_header_name_using_dkim_relaxed,
-  compute_attestation_digest_for_direct_mode,
+  compute_attestation_input_for_direct_mode,
   build_cms_signed_data_for_direct_attestation,
   mailpal,
   VERSION,
