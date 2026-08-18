@@ -478,6 +478,29 @@ export async function sign_challenge_with_tpm(
 }
 
 const ENCLAVE_DEFAULT_KEY_TAG = "com.1id.enclave.default";
+const SE_HELPER_COMMAND_TIMEOUT_MS = 15_000;
+const CTKD_RESPAWN_WAIT_MS = 3_000;
+
+function attempt_macos_cryptotokenkit_daemon_recovery(): boolean {
+  if (os.platform() !== "darwin") { return false; }
+  try {
+    const pgrep_result = child_process.execFileSync(
+      "pgrep", ["-u", String(process.getuid?.()), "-x", "ctkd"],
+      { encoding: "utf-8", timeout: 5_000 },
+    ).trim();
+    if (!pgrep_result) { return false; }
+    for (const ctkd_pid_string of pgrep_result.split("\n")) {
+      const ctkd_pid = parseInt(ctkd_pid_string.trim(), 10);
+      if (!isNaN(ctkd_pid)) {
+        process.kill(ctkd_pid, "SIGKILL");
+      }
+    }
+    child_process.execFileSync("sleep", [String(CTKD_RESPAWN_WAIT_MS / 1000)]);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function find_secure_enclave_helper_binary(): string | null {
   const se_helper_name = "oneid-se-helper";
@@ -504,6 +527,10 @@ function find_secure_enclave_helper_binary(): string | null {
  * Uses the oneid-se-helper Swift binary directly (NOT oneid-enroll, which
  * does not support enclave signing).
  * Only available on macOS with Apple Silicon or T2 security chip.
+ *
+ * If the underlying CryptoTokenKit daemon is unresponsive (a known macOS
+ * issue after prolonged uptime), the SDK automatically kills and restarts
+ * the daemon, then retries the operation.
  */
 export async function sign_challenge_with_enclave(
   nonce_b64: string,
@@ -518,18 +545,26 @@ export async function sign_challenge_with_enclave(
 
   const cmd_args = ["sign", "--tag", ENCLAVE_DEFAULT_KEY_TAG, "--nonce", nonce_b64];
 
-  try {
-    const stdout = child_process.execFileSync(se_helper_path, cmd_args, {
-      timeout: 30000,
-      encoding: "utf-8",
-    });
-    const output = JSON.parse(stdout);
-    if (output.status !== "ok") {
-      throw new HSMAccessError(`oneid-se-helper sign returned error: ${output.error ?? "unknown"}`);
+  for (let attempt_number = 0; attempt_number < 2; attempt_number++) {
+    try {
+      const stdout = child_process.execFileSync(se_helper_path, cmd_args, {
+        timeout: SE_HELPER_COMMAND_TIMEOUT_MS,
+        encoding: "utf-8",
+      });
+      const output = JSON.parse(stdout);
+      if (output.status !== "ok") {
+        throw new HSMAccessError(`oneid-se-helper sign returned error: ${output.error ?? "unknown"}`);
+      }
+      return output;
+    } catch (error: any) {
+      if (error instanceof HSMAccessError || error instanceof NoHSMError) { throw error; }
+      const timed_out = error?.killed === true || error?.signal === "SIGTERM";
+      if (timed_out && attempt_number === 0) {
+        if (attempt_macos_cryptotokenkit_daemon_recovery()) { continue; }
+      }
+      throw new HSMAccessError(`oneid-se-helper sign failed: ${error.message ?? error}`);
     }
-    return output;
-  } catch (error: any) {
-    if (error instanceof HSMAccessError || error instanceof NoHSMError) { throw error; }
-    throw new HSMAccessError(`oneid-se-helper sign failed: ${error.message ?? error}`);
   }
+
+  throw new HSMAccessError("oneid-se-helper sign failed after ctkd recovery retry");
 }
