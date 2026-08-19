@@ -420,12 +420,15 @@ export async function activate_credential(
   encrypted_secret_b64: string,
   ak_handle: string,
 ): Promise<string> {
-  const output = await run_binary_command("activate", [
+  const activate_args = [
+    "--elevated",
     "--credential-blob", credential_blob_b64,
     "--encrypted-secret", encrypted_secret_b64,
-    "--ak-handle", ak_handle,
-    "--elevated",
-  ]);
+  ];
+  if (ak_handle && ak_handle !== "transient") {
+    activate_args.push("--ak-handle", ak_handle);
+  }
+  const output = await run_binary_command("activate", activate_args, true, 120_000);
   return (output.decrypted_credential as string) ?? "";
 }
 

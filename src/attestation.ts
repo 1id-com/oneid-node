@@ -291,10 +291,12 @@ const _OID_DATA = "1.2.840.113549.1.7.1";
 const _OID_SHA256 = "2.16.840.1.101.3.4.2.1";
 const _OID_SHA256_WITH_RSA = "1.2.840.113549.1.1.11";
 const _OID_ECDSA_WITH_SHA256 = "1.2.840.10045.4.3.2";
+const _OID_ED25519 = "1.3.101.112";
 
 const _RFC_ALG_TO_SIGNATURE_OID: Record<string, string> = {
   "RS256": _OID_SHA256_WITH_RSA,
   "ES256": _OID_ECDSA_WITH_SHA256,
+  "EdDSA": _OID_ED25519,
 };
 
 function parse_pem_certificates_to_der(certificate_chain_pem: string): Buffer[] {
@@ -368,10 +370,14 @@ export function build_cms_signed_data_for_direct_attestation(
     throw new Error(`Unsupported signature algorithm: ${signature_algorithm_rfc_name}`);
   }
 
-  const sha256_algorithm_identifier = der_encode_tlv(0x30,
-    Buffer.concat([der_encode_oid(_OID_SHA256), der_encode_tlv(0x05, Buffer.alloc(0))]));
+  // RFC 8419: EdDSA uses its own OID as digestAlgorithm (PureEdDSA has no
+  // separate hash step). All other algorithms use SHA-256.
+  const digest_algorithm_identifier = signature_algorithm_rfc_name === "EdDSA"
+    ? der_encode_tlv(0x30, der_encode_oid(_OID_ED25519))
+    : der_encode_tlv(0x30,
+        Buffer.concat([der_encode_oid(_OID_SHA256), der_encode_tlv(0x05, Buffer.alloc(0))]));
 
-  const digest_algorithms_set = der_encode_tlv(0x31, sha256_algorithm_identifier);
+  const digest_algorithms_set = der_encode_tlv(0x31, digest_algorithm_identifier);
   const encap_content_info = der_encode_tlv(0x30, der_encode_oid(_OID_DATA));
   const all_certs_content = Buffer.concat(certificate_der_list);
   const certificates_implicit_set = der_encode_tlv(0xA0, all_certs_content);
@@ -386,7 +392,7 @@ export function build_cms_signed_data_for_direct_attestation(
   const signer_info = der_encode_tlv(0x30, Buffer.concat([
     der_encode_integer(1n),
     issuer_and_serial_number,
-    sha256_algorithm_identifier,
+    digest_algorithm_identifier,
     signature_algorithm_identifier,
     signature_octet_string,
   ]));
@@ -411,6 +417,7 @@ export async function prepare_direct_hardware_attestation(
   email_headers: Record<string, string>,
   body: Buffer,
   agent_identity_urn?: string,
+  binding_jws?: string,
 ): Promise<DirectAttestationProof> {
   const creds = load_credentials();
   const trust_tier = creds.trust_tier ?? "declared";
@@ -503,6 +510,9 @@ export async function prepare_direct_hardware_attestation(
   if (agent_identity_urn) {
     final_header_value += `; aid=${agent_identity_urn}`;
   }
+  if (binding_jws) {
+    final_header_value += `; bind=${binding_jws}`;
+  }
 
   const body_digest_hex = createHash("sha256").update(body).digest("hex");
 
@@ -520,7 +530,7 @@ export async function prepareAttestation(
     contentDigest,
     emailHeaders,
     body,
-    disclosedClaims = ["trust_tier"],
+    disclosedClaims = ["aid"],
     includeContactToken = true,
     includeSdJwt = true,
     apiBaseUrl,
@@ -671,6 +681,34 @@ async function _fetch_sd_jwt_proof_for_message(
     disclosures: data.disclosures ?? {},
   };
 }
+
+async function _fetch_binding_jws(
+  api_base_url: string,
+  auth_headers: Record<string, string>,
+  proof_public_key_jwk: Record<string, unknown>,
+): Promise<string | null> {
+  const url = `${api_base_url}/api/v1/proof/binding`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { ...auth_headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ proof_public_key_jwk }),
+      signal: AbortSignal.timeout(_HTTP_TIMEOUT_MILLISECONDS),
+    });
+
+    if (!response.ok) {
+      console.warn(`Binding JWS request failed (HTTP ${response.status})`);
+      return null;
+    }
+
+    const data = ((await response.json()) as Record<string, any>).data ?? {};
+    return (data.binding_jws as string) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 
 async function _fetch_contact_token(
   api_base_url: string,
