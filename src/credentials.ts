@@ -35,7 +35,7 @@ const CREDENTIALS_FILENAME = "credentials.json";
  * without re-enrolling.
  */
 export interface StoredCredentials {
-  /** The 1id internal ID (e.g., '1id-a7b3c9d2'), used as OAuth2 client_id. */
+  /** The canonical ID (e.g., 'id-njshj-zhshb-sqpck-bghgw'), used as OAuth2 client_id. */
   client_id: string;
   /** OAuth2 client secret issued by Keycloak. */
   client_secret: string;
@@ -55,7 +55,7 @@ export interface StoredCredentials {
   enrolled_at?: string | null;
   /** Friendly name chosen by the agent (e.g., "Clawdia", "Sparky"). */
   display_name?: string | null;
-  /** Agent Identity URN (e.g., 'urn:aid:1id.com:1id-a7b3c9d2'), or null if not yet assigned. */
+  /** Agent Identity URN (e.g., 'urn:aid:global:id-njshj-zhshb-sqpck-bghgw'), or null if not yet assigned. */
   agent_identity_urn?: string | null;
   /** Full PEM-encoded certificate chain (leaf -> intermediate -> root) issued during enrollment. */
   identity_certificate_chain_pem?: string | null;
