@@ -42,7 +42,7 @@ console.log(`I am ${me.handle} (tier: ${me.trust_tier})`);
 
 ## Trust Tiers
 
-RFC: `draft-drake-email-hardware-attestation-00` Section 3.
+RFC: `draft-drake-email-hardware-attestation-03` Section 3, `draft-drake-agent-identity-registry-04` Section 3.
 
 | Tier | Hardware | Sybil Resistant | Trust Level |
 |------|----------|-----------------|-------------|
@@ -83,7 +83,7 @@ Read the local identity (no network call).
 
 ```typescript
 const me = oneid.whoami();
-// me.internal_id, me.handle, me.trust_tier, etc.
+// me.canonical_id, me.handle, me.trust_tier, me.agent_identity_urn, etc.
 ```
 
 ### `oneid.credentials_exist()`

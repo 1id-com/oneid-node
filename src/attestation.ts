@@ -472,6 +472,9 @@ export async function prepare_direct_hardware_attestation(
   if (agent_identity_urn) {
     header_template_without_chain += `; aid=${agent_identity_urn}`;
   }
+  if (binding_jws) {
+    header_template_without_chain += `; bind=${binding_jws}`;
+  }
 
   const attestation_input_72_bytes = compute_attestation_input_for_direct_mode(
     email_headers, body, attestation_timestamp, header_template_without_chain,
