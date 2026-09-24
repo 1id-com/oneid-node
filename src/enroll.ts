@@ -638,7 +638,8 @@ async function enroll_hsm_tier(
   const {
     detect_available_hsms,
     extract_attestation_data,
-    activate_credential,
+    import_and_certify_wrapped_object_with_tpm,
+    sign_challenge_with_tpm,
   } = await import("./helper.js");
 
   // Step 1: Detect HSMs via Go binary
@@ -660,16 +661,14 @@ async function enroll_hsm_tier(
     );
   }
 
-  // Step 3: Extract attestation (requires elevation)
+  // No elevation anywhere (tracker C10 R-A): extraction, "welcome back"
+  // re-authentication and new enrollment all run as the ordinary user.
   const attestation_data = await extract_attestation_data(selected_hsm);
-
-  // Step 4: Begin enrollment with server (or recover if EK is already registered)
   const api_client = new OneIDAPIClient(api_base_url);
-  let begin_response: Record<string, unknown>;
-  let this_is_a_recovery_not_a_new_enrollment = false;
+  let activate_response: Record<string, unknown>;
 
   try {
-    begin_response = await api_client.enroll_begin(
+    const begin_response = await api_client.enroll_begin(
       attestation_data.ek_cert_pem as string,
       (attestation_data.ak_public_pem as string) ?? "",
       (attestation_data.ak_tpmt_public_b64 as string) ?? "",
@@ -679,51 +678,44 @@ async function enroll_hsm_tier(
       operator_email,
       requested_handle,
     );
-  } catch (enroll_begin_error) {
-    if (enroll_begin_error instanceof AlreadyEnrolledError) {
-      console.log(
-        "[oneid] Hardware already registered -- attempting identity recovery. " +
-        "The hardware IS the identity; proving TPM possession recovers credentials."
-      );
-      begin_response = await api_client.recover_begin(
-        attestation_data.ek_cert_pem as string,
-        (attestation_data.ak_public_pem as string) ?? "",
-        (attestation_data.ak_tpmt_public_b64 as string) ?? "",
-        (attestation_data.ek_public_pem as string) ?? "",
-        (attestation_data.chain_pem as string[]) ?? undefined,
-      );
-      this_is_a_recovery_not_a_new_enrollment = true;
-    } else {
-      throw enroll_begin_error;
+    const proof = await import_and_certify_wrapped_object_with_tpm(
+      begin_response.wrapped_object_public as string,
+      begin_response.wrapped_object_duplicate as string,
+      begin_response.wrapped_object_in_sym_seed as string,
+      begin_response.certify_nonce as string,
+    );
+    activate_response = await api_client.enroll_activate(
+      begin_response.enrollment_session_id as string,
+      null,
+      proof.certify_info as string,
+      proof.certify_signature as string,
+    );
+  } catch (enroll_error) {
+    if (!(enroll_error instanceof AlreadyEnrolledError)) {
+      throw enroll_error;
     }
+    // A forgetful agent enrolling again gets its existing identity back.
+    const sign_based_begin_response = await api_client.recover_begin_sign_based(
+      attestation_data.ek_cert_pem as string,
+      (attestation_data.ak_public_pem as string) ?? "",
+      (attestation_data.ak_tpmt_public_b64 as string) ?? "",
+      (attestation_data.ek_public_pem as string) ?? "",
+      (attestation_data.chain_pem as string[]) ?? undefined,
+    );
+    const signature = await sign_challenge_with_tpm(
+      sign_based_begin_response.nonce_challenge as string,
+      "",
+    );
+    activate_response = await api_client.recover_activate_sign_based(
+      sign_based_begin_response.recovery_session_id as string,
+      signature.signature_b64 as string,
+    );
   }
 
-  // Step 5: Activate credential via TPM (requires elevation)
-  const session_id_field = this_is_a_recovery_not_a_new_enrollment
-    ? "recovery_session_id" : "enrollment_session_id";
-  const decrypted_credential = await activate_credential(
-    selected_hsm,
-    begin_response.credential_blob as string,
-    begin_response.encrypted_secret as string,
-    (attestation_data.ak_handle as string) ?? "0x81000100",
-  );
-
-  // Step 6: Complete enrollment (or recovery) with server
-  let activate_response: Record<string, unknown>;
-  if (this_is_a_recovery_not_a_new_enrollment) {
-    activate_response = await api_client.recover_activate(
-      begin_response[session_id_field] as string,
-      decrypted_credential,
-    );
-    console.log(
-      `[oneid] Identity recovered: ${((activate_response.identity as Record<string, unknown>)?.agent_id as string) ?? "unknown"} ` +
-      "(the hardware proved it is the same machine)"
-    );
-  } else {
-    activate_response = await api_client.enroll_activate(
-      begin_response[session_id_field] as string,
-      decrypted_credential,
-    );
+  const message_for_agent = (activate_response.message_for_agent as string) ?? null;
+  if (message_for_agent) {
+    // Shown to the agent: who it is, its handle and handle status (tracker C11).
+    console.log(`[oneid] ${message_for_agent}`);
   }
 
   // Step 7: Store credentials and return Identity
@@ -786,6 +778,8 @@ async function enroll_hsm_tier(
     key_algorithm: KeyAlgorithm.RSA_2048,
     agent_identity_urn: agent_identity_urn || null,
     display_name,
+    message_for_agent,
+    handle_summary: (activate_response.handle_summary as Record<string, unknown>) ?? null,
   };
 }
 

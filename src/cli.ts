@@ -14,12 +14,13 @@
  *     curl -H "Authorization: Bearer $TOKEN" https://api.example.com/
  */
 
+import { SDK_VERSION } from "./version.js";
 import { credentials_exist, load_credentials, get_credentials_file_path, delete_credentials } from "./credentials.js";
 import { enroll } from "./enroll.js";
 import { get_token } from "./auth.js";
 import { TrustTier, format_identity_as_display_string } from "./identity.js";
 
-const VERSION = "0.5.0";
+const VERSION = SDK_VERSION;
 
 function print_help(): void {
   console.log(`oneid ${VERSION} -- 1id.com identity for AI agents

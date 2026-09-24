@@ -14,6 +14,7 @@
  *   {"ok": false, "data": null, "error": {"code": "...", "message": "..."}}
  */
 
+import { SDK_USER_AGENT } from "./version.js";
 import * as https from "node:https";
 import * as http from "node:http";
 import { DEFAULT_API_BASE_URL } from "./credentials.js";
@@ -25,7 +26,7 @@ import {
 
 // -- HTTP client configuration --
 const DEFAULT_HTTP_TIMEOUT_MILLISECONDS = 30_000;
-const USER_AGENT = "oneid-sdk-node/1.0.0";
+const USER_AGENT = SDK_USER_AGENT;
 
 interface RequestOptions {
   method: string;
@@ -255,11 +256,52 @@ export class OneIDAPIClient {
    */
   async enroll_activate(
     enrollment_session_id: string,
-    decrypted_credential: string,
+    decrypted_credential: string | null = null,
+    certify_info_b64: string | null = null,
+    certify_signature_b64: string | null = null,
   ): Promise<Record<string, unknown>> {
-    return this._make_request("POST", "/api/v1/enroll/activate", {
-      enrollment_session_id,
-      decrypted_credential,
+    // TPM: certify_info + certify_signature from the import-and-certify proof
+    // (no elevation). PIV/enclave: the nonce signature as decrypted_credential.
+    const request_body: Record<string, unknown> = { enrollment_session_id };
+    if (decrypted_credential != null) { request_body.decrypted_credential = decrypted_credential; }
+    if (certify_info_b64 != null) {
+      request_body.certify_info = certify_info_b64;
+      request_body.certify_signature = certify_signature_b64;
+    }
+    return this._make_request("POST", "/api/v1/enroll/activate", request_body);
+  }
+
+  /**
+   * "Welcome back": an already-enrolled TPM re-authenticates with a plain TPM
+   * signature over a server nonce (no elevation). The identity is disclosed
+   * only after the signature verifies.
+   */
+  async recover_begin_sign_based(
+    ek_certificate_pem: string,
+    ak_public_key_pem: string,
+    ak_tpmt_public_b64: string = "",
+    ek_public_key_pem: string = "",
+    ek_certificate_chain_pem?: string[],
+  ): Promise<Record<string, unknown>> {
+    const request_body: Record<string, unknown> = {
+      ek_certificate_pem,
+      ak_public_key_pem,
+      ak_tpmt_public_b64,
+    };
+    if (ek_public_key_pem) { request_body.ek_public_key_pem = ek_public_key_pem; }
+    if (ek_certificate_chain_pem && ek_certificate_chain_pem.length > 0) {
+      request_body.ek_certificate_chain_pem = ek_certificate_chain_pem;
+    }
+    return this._make_request("POST", "/api/v1/enroll/recover/sign-based", request_body);
+  }
+
+  async recover_activate_sign_based(
+    recovery_session_id: string,
+    signed_nonce_b64: string,
+  ): Promise<Record<string, unknown>> {
+    return this._make_request("POST", "/api/v1/enroll/recover/sign-based/activate", {
+      enrollment_session_id: recovery_session_id,
+      decrypted_credential: signed_nonce_b64,
     });
   }
 

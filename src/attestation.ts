@@ -25,15 +25,18 @@
  * Nonce algorithm: Section 5.3 (message-binding via issuer-signed nonce).
  */
 
-import { createHash } from "crypto";
+import { createHash, constants as crypto_constants, verify as crypto_verify, X509Certificate } from "crypto";
 import { get_token } from "./auth.js";
 import { load_credentials } from "./credentials.js";
 import { AuthenticationError, NetworkError, NotEnrolledError } from "./exceptions.js";
 
 const _HTTP_TIMEOUT_MILLISECONDS = 15_000;
 
-const _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING = [
+// Email draft (2026-09-24): both modes ALWAYS cover these nine fields; a
+// listed field that is absent is fine (DKIM rule: protects against addition).
+export const _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING = [
   "from", "to", "subject", "date", "message-id",
+  "reply-to", "mime-version", "content-type", "content-transfer-encoding",
 ];
 
 export interface AttestationProof {
@@ -54,17 +57,46 @@ export interface PrepareAttestationOptions {
   includeContactToken?: boolean;
   includeSdJwt?: boolean;
   apiBaseUrl?: string;
+  /** Combined mode only: the Mode 1 proof public key; the issuer puts it in the
+   *  signed payload as non-selective cnf.jwk (AUD-F47). Omit for standalone Mode 2. */
+  cnfJwk?: Record<string, unknown>;
 }
 
 export function canonicalise_header_value_using_dkim_relaxed(raw_value: string): string {
-  let normalized = raw_value.replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
-  let unfolded = normalized.replace(/\r\n[ \t]/g, " ");
+  // Keep encoded words as wire text and apply DKIM2 -06 Section 6.2 rather
+  // than decoding or applying the subtly different DKIM1 relaxed algorithm.
+  const unfolded = raw_value.replace(/\r?\n(?=[ \t])/g, "");
   const compressed = unfolded.replace(/[ \t]+/g, " ");
-  return compressed.trim();
+  return compressed.replace(/^[ \t]+|[ \t]+$/g, "");
 }
 
 export function canonicalise_header_name_using_dkim_relaxed(raw_name: string): string {
-  return raw_name.trim().toLowerCase();
+  return raw_name.replace(/^[ \t]+|[ \t]+$/g, "").toLowerCase();
+}
+
+export function canonicalise_selected_header_field_using_dkim2_header_hash_rules(
+  raw_header_field_name: string,
+  raw_header_field_value: string,
+): string {
+  const canonical_header_field_name = canonicalise_header_name_using_dkim_relaxed(
+    raw_header_field_name
+  );
+  const canonical_header_field_value = canonicalise_header_value_using_dkim_relaxed(
+    raw_header_field_value
+  );
+  return `${canonical_header_field_name}:${canonical_header_field_value}\r\n`;
+}
+
+export function canonicalise_hardware_attestation_self_reference_using_dkim2_signature_rules(
+  hardware_attestation_header_value_with_empty_chain: string,
+): string {
+  // DKIM2 -06 Section 9.6 removes every WSP octet from the unfolded
+  // signature field while retaining the colon, tag separators, and CRLF.
+  const unfolded_header_value = hardware_attestation_header_value_with_empty_chain.replace(
+    /\r?\n(?=[ \t])/g, ""
+  );
+  const header_value_without_wsp = unfolded_header_value.replace(/[ \t]+/g, "");
+  return `hardware-attestation:${header_value_without_wsp}\r\n`;
 }
 
 export function _select_headers_bottom_up_per_dkim(
@@ -102,25 +134,18 @@ export function canonicalise_headers_for_message_binding(
     lowered_headers[k.trim().toLowerCase()] = v;
   }
 
-  for (const required_header_name of _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING) {
-    if (!(required_header_name in lowered_headers)) {
-      throw new Error(
-        `Missing required email header '${required_header_name}' for RFC message-binding nonce. ` +
-        `Required headers: ${_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING.join(", ")}`
-      );
-    }
-  }
-
-  // email-03 Mode 2 covers a FIXED set: exactly From, To, Subject, Date,
-  // Message-ID, in THAT order, each once -- no oversigning, no bottom-up
+  // email-03 Mode 2 covers a FIXED set: the nine always-covered fields
+  // (_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING), in THAT order, each once -- no oversigning, no bottom-up
   // selection (Mode 2 carries no explicit h= list, so its covered set
   // must be fixed and known to both sides).
   const canonicalised_header_lines: string[] = [];
   for (const required_header_name of _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING) {
-    const canon_name = canonicalise_header_name_using_dkim_relaxed(required_header_name);
-    const canon_value = canonicalise_header_value_using_dkim_relaxed(
-      lowered_headers[required_header_name]);
-    canonicalised_header_lines.push(`${canon_name}:${canon_value}\r\n`);
+    if (!(required_header_name in lowered_headers)) { continue; }  // absent: contributes nothing
+    canonicalised_header_lines.push(
+      canonicalise_selected_header_field_using_dkim2_header_hash_rules(
+        required_header_name, lowered_headers[required_header_name]
+      )
+    );
   }
 
   canonicalised_header_lines.push(
@@ -186,19 +211,11 @@ export function canonicalise_headers_for_direct_attestation(
     lowered_headers[k.trim().toLowerCase()] = v;
   }
 
-  for (const required_header_name of _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING) {
-    if (!(required_header_name in lowered_headers)) {
-      throw new Error(
-        `Missing required email header '${required_header_name}' for Mode 1 attestation. ` +
-        `Required headers: ${_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING.join(", ")}`
-      );
-    }
-  }
 
   const all_header_names: string[] = [..._MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING];
   const extra_names = Object.keys(lowered_headers).filter(
     h => !_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING.includes(h) &&
-         h !== "hardware-attestation" && h !== "hardware-trust-proof"
+         h !== "hardware-attestation"
   ).sort();
   all_header_names.push(...extra_names);
   all_header_names.push(...all_header_names);
@@ -209,13 +226,15 @@ export function canonicalise_headers_for_direct_attestation(
   const canonicalised_header_lines: string[] = [];
   for (const entry of selected) {
     if (entry === null) { continue; }
-    const canon_name = canonicalise_header_name_using_dkim_relaxed(entry[0]);
-    const canon_value = canonicalise_header_value_using_dkim_relaxed(entry[1]);
-    canonicalised_header_lines.push(`${canon_name}:${canon_value}\r\n`);
+    canonicalised_header_lines.push(
+      canonicalise_selected_header_field_using_dkim2_header_hash_rules(entry[0], entry[1])
+    );
   }
 
   canonicalised_header_lines.push(
-    `hardware-attestation:${hardware_attestation_header_value_without_chain}`
+    canonicalise_hardware_attestation_self_reference_using_dkim2_signature_rules(
+      hardware_attestation_header_value_without_chain
+    )
   );
 
   return Buffer.from(canonicalised_header_lines.join(""), "utf-8");
@@ -293,9 +312,25 @@ const _OID_SHA256_WITH_RSA = "1.2.840.113549.1.1.11";
 const _OID_ECDSA_WITH_SHA256 = "1.2.840.10045.4.3.2";
 const _OID_ED25519 = "1.3.101.112";
 
+// Email draft "CMS Algorithm Mapping" (AUD-F23): the exact DER AlgorithmIdentifier
+// generated for each Version 1 alg. SHA-256 parameters are absent (RFC 5754); RS256
+// carries NULL; ES256 has none; PS256 encodes SHA-256, MGF1-SHA-256 and salt 32
+// (trailerField 1 is the DER default, so omitted). Byte-identical to OpenSSL 3.2.
+const _DER_SHA256_DIGEST_ALGORITHM_IDENTIFIER_WITH_ABSENT_PARAMETERS = Buffer.from("300b0609608648016503040201", "hex");
+const _RFC_ALG_TO_DER_SIGNATURE_ALGORITHM_IDENTIFIER: Record<string, Buffer> = {
+  "RS256": Buffer.from("300d06092a864886f70d01010b0500", "hex"),
+  "ES256": Buffer.from("300a06082a8648ce3d040302", "hex"),
+  "PS256": Buffer.from(
+    "304106092a864886f70d01010a3034a00f300d06096086480165030402010500" +
+    "a11c301a06092a864886f70d010108300d06096086480165030402010500a203020120",
+    "hex",
+  ),
+};
+
 const _RFC_ALG_TO_SIGNATURE_OID: Record<string, string> = {
   "RS256": _OID_SHA256_WITH_RSA,
   "ES256": _OID_ECDSA_WITH_SHA256,
+  "PS256": "1.2.840.113549.1.1.10",
   "EdDSA": _OID_ED25519,
 };
 
@@ -370,12 +405,11 @@ export function build_cms_signed_data_for_direct_attestation(
     throw new Error(`Unsupported signature algorithm: ${signature_algorithm_rfc_name}`);
   }
 
-  // RFC 8419: EdDSA uses its own OID as digestAlgorithm (PureEdDSA has no
-  // separate hash step). All other algorithms use SHA-256.
+  // RFC 8419 s3.1: with Ed25519 the digestAlgorithm MUST be id-sha512, parameters
+  // absent (OWN-022; EdDSA is outside Version 1). All other algorithms use SHA-256.
   const digest_algorithm_identifier = signature_algorithm_rfc_name === "EdDSA"
-    ? der_encode_tlv(0x30, der_encode_oid(_OID_ED25519))
-    : der_encode_tlv(0x30,
-        Buffer.concat([der_encode_oid(_OID_SHA256), der_encode_tlv(0x05, Buffer.alloc(0))]));
+    ? der_encode_tlv(0x30, der_encode_oid("2.16.840.1.101.3.4.2.3"))  // id-sha512
+    : _DER_SHA256_DIGEST_ALGORITHM_IDENTIFIER_WITH_ABSENT_PARAMETERS;
 
   const digest_algorithms_set = der_encode_tlv(0x31, digest_algorithm_identifier);
   const encap_content_info = der_encode_tlv(0x30, der_encode_oid(_OID_DATA));
@@ -386,7 +420,8 @@ export function build_cms_signed_data_for_direct_attestation(
   const issuer_and_serial_number = der_encode_tlv(0x30,
     Buffer.concat([issuer_der, der_encode_integer(serial_number)]));
 
-  const signature_algorithm_identifier = der_encode_tlv(0x30, der_encode_oid(signature_oid_string));
+  const signature_algorithm_identifier = _RFC_ALG_TO_DER_SIGNATURE_ALGORITHM_IDENTIFIER[signature_algorithm_rfc_name]
+    ?? der_encode_tlv(0x30, der_encode_oid(signature_oid_string));
   const signature_octet_string = der_encode_tlv(0x04, signature_bytes);
 
   const signer_info = der_encode_tlv(0x30, Buffer.concat([
@@ -413,6 +448,53 @@ export function build_cms_signed_data_for_direct_attestation(
   ]));
 }
 
+/**
+ * True when the first (leaf) certificate of the chain holds the public key
+ * that produced `signature_bytes` over the 72-octet attestation-input under
+ * the Version 1 alg (RS256 PKCS#1 v1.5, PS256 salt 32, ES256 DER ECDSA).
+ */
+export function certificate_chain_leaf_key_verifies_mode1_signature(
+  certificate_chain_pem: string,
+  attestation_input_72_bytes: Buffer,
+  signature_bytes: Buffer,
+  rfc_alg: string,
+): boolean {
+  const leaf_pem_match = certificate_chain_pem.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/);
+  if (!leaf_pem_match) { return false; }
+  try {
+    const leaf_public_key = new X509Certificate(leaf_pem_match[0]).publicKey;
+    if (rfc_alg === "ES256") {
+      return crypto_verify("sha256", attestation_input_72_bytes, { key: leaf_public_key, dsaEncoding: "der" }, signature_bytes);
+    }
+    if (rfc_alg === "PS256") {
+      return crypto_verify("sha256", attestation_input_72_bytes,
+        { key: leaf_public_key, padding: crypto_constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 }, signature_bytes);
+    }
+    if (rfc_alg === "RS256") {
+      return crypto_verify("sha256", attestation_input_72_bytes,
+        { key: leaf_public_key, padding: crypto_constants.RSA_PKCS1_PADDING }, signature_bytes);
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Public JWK (kty/crv/x/y or kty/n/e) of the first certificate in a PEM chain, or null. */
+export function public_key_jwk_of_certificate_chain_leaf(certificate_chain_pem: string): Record<string, unknown> | null {
+  const leaf_pem_match = certificate_chain_pem.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/);
+  if (!leaf_pem_match) { return null; }
+  try {
+    const exported = new X509Certificate(leaf_pem_match[0]).publicKey.export({ format: "jwk" }) as Record<string, unknown>;
+    const public_member_names = exported["kty"] === "EC" ? ["kty", "crv", "x", "y"] : ["kty", "n", "e"];
+    return Object.fromEntries(public_member_names.map(name => [name, exported[name]]));
+  } catch {
+    return null;
+  }
+}
+
+// CROSS_IMPL_SYNC: mode1_attestation
+// Implementations: py:oneid/attestation.py node:src/attestation.ts
 export async function prepare_direct_hardware_attestation(
   email_headers: Record<string, string>,
   body: Buffer,
@@ -421,7 +503,17 @@ export async function prepare_direct_hardware_attestation(
 ): Promise<DirectAttestationProof> {
   const creds = load_credentials();
   const trust_tier = creds.trust_tier ?? "declared";
-  const typ_parameter = _TRUST_TIER_TO_RFC_TYP_PARAMETER[trust_tier] ?? "SFT";
+  // AUD-F66: the active local binding decides which device signs (the same
+  // rule auth.ts uses): a PIV key reference means the YubiKey signs even when
+  // the identity-level tier is sovereign. typ follows the signing device.
+  const signing_device_type: "piv" | "enclave" | "tpm" | "software" | null =
+    ((creds.hsm_key_reference ?? "").startsWith("piv-") || trust_tier === "portable") ? "piv"
+    : trust_tier === "enclave" ? "enclave"
+    : (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") ? "tpm"
+    : creds.private_key_pem ? "software" : null;
+  const typ_parameter = signing_device_type === "piv"
+    ? "PIV"
+    : (_TRUST_TIER_TO_RFC_TYP_PARAMETER[trust_tier] ?? "SFT");
 
   if (!creds.identity_certificate_chain_pem) {
     throw new NotEnrolledError(
@@ -432,6 +524,11 @@ export async function prepare_direct_hardware_attestation(
 
   if (!agent_identity_urn) {
     agent_identity_urn = creds.agent_identity_urn ?? undefined;
+  }
+  // AUD-F46: aid and bind appear together or not at all; a sender MUST NOT
+  // place aid without the Registrar binding assertion (email draft).
+  if (agent_identity_urn && !binding_jws) {
+    agent_identity_urn = undefined;
   }
 
   const attestation_timestamp = Math.floor(Date.now() / 1000);
@@ -447,19 +544,27 @@ export async function prepare_direct_hardware_attestation(
   const all_signed_names: string[] = [..._MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING];
   const extra_header_names = Object.keys(lowered_headers).filter(
     h => !_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING.includes(h) &&
-         h !== "hardware-attestation" && h !== "hardware-trust-proof"
+         h !== "hardware-attestation"
   ).sort();
   all_signed_names.push(...extra_header_names);
   const signed_header_names = all_signed_names.join(":") + ":" + all_signed_names.join(":");
 
   let algorithm_for_header: string;
-  if (trust_tier === "portable" || trust_tier === "enclave") {
+  if (signing_device_type === "piv" || signing_device_type === "enclave") {
     algorithm_for_header = "ES256";
-  } else if (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") {
+  } else if (signing_device_type === "tpm") {
     algorithm_for_header = "RS256";
-  } else if (creds.private_key_pem) {
+  } else if (signing_device_type === "software" && creds.private_key_pem) {
     const { determine_signing_algorithm_name } = await import("./verify.js");
     algorithm_for_header = determine_signing_algorithm_name(creds);
+    if (!(algorithm_for_header in _RFC_ALG_TO_DER_SIGNATURE_ALGORITHM_IDENTIFIER)) {
+      // AUD-F22/F60: Version 1 Mode 1 allows only RS256 / ES256 / PS256.
+      throw new Error(
+        `This identity's ${creds.key_algorithm} key cannot sign a Version 1 Mode 1 ` +
+        `email proof (${algorithm_for_header} is not in the email draft's CMS table). ` +
+        "Enroll a declared identity with key_algorithm 'ecdsa-p256' (the default) or use a hardware tier.",
+      );
+    }
   } else {
     throw new NotEnrolledError("No signing key available for Mode 1 attestation.");
   }
@@ -481,25 +586,34 @@ export async function prepare_direct_hardware_attestation(
   );
 
   let signature_bytes: Buffer;
-  if (trust_tier === "portable") {
+  if (signing_device_type === "piv") {
     const { sign_challenge_with_piv } = await import("./helper.js");
     const result = await sign_challenge_with_piv(attestation_input_72_bytes.toString("base64"));
     signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
-  } else if (trust_tier === "enclave") {
+  } else if (signing_device_type === "enclave") {
     const { sign_challenge_with_enclave } = await import("./helper.js");
     const result = await sign_challenge_with_enclave(attestation_input_72_bytes.toString("base64"));
     signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
-  } else if (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") {
+  } else if (signing_device_type === "tpm") {
     const { sign_challenge_with_tpm } = await import("./helper.js");
     const result = await sign_challenge_with_tpm(attestation_input_72_bytes.toString("base64"), creds.hsm_key_reference ?? "");
     signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
-  } else if (creds.private_key_pem) {
+  } else if (signing_device_type === "software" && creds.private_key_pem) {
     const { sign_challenge_with_private_key } = await import("./keys.js");
     signature_bytes = sign_challenge_with_private_key(creds.private_key_pem, attestation_input_72_bytes);
   } else {
     throw new NotEnrolledError("No signing key available.");
   }
 
+  // AUD-F57: the CMS signer certificate must carry the key that produced this
+  // signature. Fail closed rather than package another device's certificate.
+  if (!certificate_chain_leaf_key_verifies_mode1_signature(
+      creds.identity_certificate_chain_pem, attestation_input_72_bytes, signature_bytes, algorithm_for_header)) {
+    throw new Error(
+      `The stored certificate chain does not match the ${signing_device_type} key that signed this ` +
+      "Mode 1 proof; re-sync device certificates or re-enroll before sending Mode 1.",
+    );
+  }
   const cms_der_bytes = build_cms_signed_data_for_direct_attestation(
     signature_bytes, creds.identity_certificate_chain_pem, algorithm_for_header,
   );
@@ -525,6 +639,8 @@ export async function prepare_direct_hardware_attestation(
   };
 }
 
+// CROSS_IMPL_SYNC: mode2_attestation
+// Implementations: py:oneid/attestation.py node:src/attestation.ts
 export async function prepareAttestation(
   options: PrepareAttestationOptions = {},
 ): Promise<AttestationProof> {
@@ -537,6 +653,7 @@ export async function prepareAttestation(
     includeContactToken = true,
     includeSdJwt = true,
     apiBaseUrl,
+    cnfJwk,
   } = options;
 
   const rfc_email_mode_is_active = emailHeaders != null;
@@ -629,6 +746,7 @@ export async function prepareAttestation(
       proposed_iat,
       disclosedClaims,
       session_device_type_for_dynamic_trust_tiering,
+      cnfJwk,
     );
     proof.sd_jwt = sd_jwt_result.sd_jwt;
     proof.sd_jwt_disclosures = sd_jwt_result.disclosures;
@@ -650,6 +768,7 @@ async function _fetch_sd_jwt_proof_for_message(
   proposed_iat: number,
   disclosed_claims: string[],
   session_device_type?: string,
+  cnf_jwk?: Record<string, unknown>,
 ): Promise<{ sd_jwt: string | null; disclosures: Record<string, string> }> {
   const url = `${api_base_url}/api/v1/proof/sd-jwt/message`;
 
@@ -658,6 +777,7 @@ async function _fetch_sd_jwt_proof_for_message(
     proposed_iat,
     disclosed_claims,
   };
+  if (cnf_jwk) { request_body.cnf_jwk = cnf_jwk; }  // Combined mode (AUD-F47)
   if (session_device_type) { request_body.device_type = session_device_type; }
 
   const response = await fetch(url, {
@@ -740,4 +860,3 @@ async function _fetch_contact_token(
     return { token: null, contact_address: null };
   }
 }
-

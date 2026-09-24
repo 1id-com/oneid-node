@@ -36,8 +36,12 @@ export enum KeyAlgorithm {
   RSA_4096 = "rsa-4096",
 }
 
-/** The default key algorithm for declared-tier enrollment. */
-export const DEFAULT_KEY_ALGORITHM = KeyAlgorithm.ED25519;
+/**
+ * The default key algorithm for declared-tier enrollment: ECDSA P-256 (ES256),
+ * the only software key type that can also sign Version 1 Mode 1 email proofs
+ * (the email draft's CMS table allows only RS256 / ES256 / PS256; AUD-F22/F60).
+ */
+export const DEFAULT_KEY_ALGORITHM = KeyAlgorithm.ECDSA_P256;
 
 /**
  * Types of hardware security modules supported by 1id.com.
@@ -78,6 +82,10 @@ export interface Identity {
   readonly agent_identity_urn: string | null;
   /** Friendly name chosen by the agent (e.g., "Clawdia", "Sparky"). */
   readonly display_name: string | null;
+  /** What the server told the agent: who it is, its handle + handle status, or a buy-a-handle reminder. */
+  readonly message_for_agent?: string | null;
+  /** Vanity handle summary (handle, status, expiry, renewal due, fee). */
+  readonly handle_summary?: Record<string, unknown> | null;
 }
 
 /**

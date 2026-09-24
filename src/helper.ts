@@ -13,6 +13,7 @@
  * - Privilege elevation (UAC, sudo, pkexec)
  */
 
+import { SDK_USER_AGENT } from "./version.js";
 import * as child_process from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -143,7 +144,7 @@ function download_file_to_path(url: string, destination: string, max_redirects: 
     }
 
     const transport = url.startsWith("https:") ? https : http;
-    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.5.0" } }, (res) => {
+    transport.get(url, { headers: { "User-Agent": SDK_USER_AGENT } }, (res) => {
       // Handle redirects (GitHub releases redirect to S3)
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         download_file_to_path(res.headers.location, destination, max_redirects - 1)
@@ -185,7 +186,7 @@ function download_text_from_url(url: string, max_redirects: number = 5): Promise
     }
 
     const transport = url.startsWith("https:") ? https : http;
-    transport.get(url, { headers: { "User-Agent": "oneid-sdk-node/0.5.0" } }, (res) => {
+    transport.get(url, { headers: { "User-Agent": SDK_USER_AGENT } }, (res) => {
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         download_text_from_url(res.headers.location, max_redirects - 1)
           .then(resolve)
@@ -390,6 +391,8 @@ export async function run_binary_command(
  *
  * Runs 'oneid-enroll detect --json' which does NOT require elevation.
  */
+// CROSS_IMPL_SYNC: hsm_detect
+// Implementations: py:oneid/helper.py go:internal/piv/detect.go+tpm/detect.go node:src/helper.ts
 export async function detect_available_hsms(): Promise<Record<string, unknown>[]> {
   try {
     const output = await run_binary_command("detect");
@@ -402,13 +405,111 @@ export async function detect_available_hsms(): Promise<Record<string, unknown>[]
 }
 
 /**
- * Extract attestation data from an HSM (requires elevation).
+ * Signing capability tier for a specific HSM type.
+ *
+ * Tier A: Go binary (oneid-enroll) available -- handles all HSM types.
+ * Tier B: Native extension available (pcsclite for PIV) -- no subprocess needed.
+ * Tier C: Software-only -- no hardware signing possible.
+ */
+export interface SigningCapabilityTierDetectionResult {
+  tier_a_go_binary_is_available: boolean;
+  tier_a_go_binary_version: string | null;
+  tier_a_go_binary_path: string | null;
+  tier_b_piv_via_pcsclite_is_available: boolean;
+  tier_c_software_only_is_available: boolean;
+  recommended_piv_tier: "A" | "B" | "C";
+  recommended_tpm_tier: "A" | "C";
+}
+
+// CROSS_IMPL_SYNC: tier_detect
+// Implementations: py:oneid/helper.py node:src/helper.ts
+/**
+ * Detect which signing capability tiers are available on this system.
+ *
+ * The 1id SDK supports three tiers of hardware signing:
+ *
+ * Tier A -- Go binary (oneid-enroll):
+ *   Handles all HSM types (TPM, PIV, Enclave). Requires the compiled binary.
+ *   Supports --serial/--reader for multi-YubiKey targeting (v1.3.0+).
+ *
+ * Tier B -- Native Node.js extensions (pcsclite for PIV):
+ *   Direct PC/SC access without spawning a subprocess. Requires the
+ *   'pcsclite' or '@nickcis/smartcard' npm package (native C++ addon).
+ *   Currently PIV-only. Not yet implemented -- detection is a placeholder
+ *   that checks whether the pcsclite module can be loaded.
+ *
+ * Tier C -- Software-only:
+ *   No hardware signing. Always available as baseline.
+ */
+export async function detect_available_signing_capability_tiers(): Promise<SigningCapabilityTierDetectionResult> {
+  const result: SigningCapabilityTierDetectionResult = {
+    tier_a_go_binary_is_available: false,
+    tier_a_go_binary_version: null,
+    tier_a_go_binary_path: null,
+    tier_b_piv_via_pcsclite_is_available: false,
+    tier_c_software_only_is_available: true,
+    recommended_piv_tier: "C",
+    recommended_tpm_tier: "C",
+  };
+
+  // Tier A: Go binary check
+  try {
+    const binary_path = find_binary();
+    if (binary_path != null) {
+      const version_output = await run_binary_command("version");
+      result.tier_a_go_binary_is_available = true;
+      result.tier_a_go_binary_version = (version_output.version as string) ?? null;
+      result.tier_a_go_binary_path = binary_path;
+      result.recommended_piv_tier = "A";
+      result.recommended_tpm_tier = "A";
+    }
+  } catch {
+    // Go binary not available or not working
+  }
+
+  // Tier B PIV: smartcard npm package check
+  // The 'smartcard' package provides N-API PC/SC access from Node.js.
+  // When available, it enables multi-YubiKey enumeration and targeted
+  // PIV signing without the Go binary.
+  if (is_tier_b_piv_via_smartcard_available()) {
+    result.tier_b_piv_via_pcsclite_is_available = true;
+    if (!result.tier_a_go_binary_is_available) {
+      result.recommended_piv_tier = "B";
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Extract attestation data from an HSM. Never elevates: EK/NV reads and
+ * transient CreatePrimary work as an ordinary user (oneid-enroll >= 2.0.0).
  */
 export async function extract_attestation_data(
   hsm: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const hsm_type = (hsm.type as string) ?? "tpm";
-  return run_binary_command("extract", ["--type", hsm_type, "--elevated"]);
+  return run_binary_command("extract", ["--type", hsm_type]);
+}
+
+/**
+ * Enrollment co-residency proof that needs NO elevation (oneid-enroll >= 2.0.0):
+ * import the Registrar-wrapped object under the EK, load it, and certify it
+ * with the AK over the Registrar nonce. Windows allows these TPM commands to
+ * ordinary users (ActivateCredential it does not).
+ */
+export async function import_and_certify_wrapped_object_with_tpm(
+  wrapped_object_public_b64: string,
+  wrapped_object_duplicate_b64: string,
+  wrapped_object_in_sym_seed_b64: string,
+  certify_nonce_b64: string,
+): Promise<Record<string, unknown>> {
+  return run_binary_command("import-certify", [
+    "--wrapped-object-public", wrapped_object_public_b64,
+    "--wrapped-object-duplicate", wrapped_object_duplicate_b64,
+    "--wrapped-object-in-sym-seed", wrapped_object_in_sym_seed_b64,
+    "--certify-nonce", certify_nonce_b64,
+  ], false, 120_000);
 }
 
 /**
@@ -455,14 +556,81 @@ export async function setup_tbs_for_non_admin_tpm_access(): Promise<Record<strin
  * key (ECDSA-SHA256), proving it controls the hardware that was attested.
  *
  * PIV slot 9a with pin-policy=NEVER means no human interaction required.
+ *
+ * Uses a tiered fallback strategy:
+ *
+ *   Tier A (Go binary): Spawns oneid-enroll with --serial/--reader targeting.
+ *     Supports all platforms. v1.3.0+ supports multi-YubiKey by serial.
+ *   Tier B (pcsclite): Direct PC/SC signing from Node.js without subprocess.
+ *     Requires the pcsclite npm package (native C++ addon). NOT YET IMPLEMENTED.
+ *   Tier C: Not applicable for PIV (hardware key is required).
+ *
+ * Currently uses Tier A exclusively. When pcsclite support is added, this
+ * function will attempt Tier A first and fall back to Tier B if the Go binary
+ * is unavailable.
  */
+// CROSS_IMPL_SYNC: piv_sign
+// Implementations: py:oneid/helper.py go:internal/piv/sign.go node:src/helper.ts
 export async function sign_challenge_with_piv(
   nonce_b64: string,
+  piv_serial_number?: number,
+  piv_reader_name_substring?: string,
 ): Promise<Record<string, unknown>> {
-  return run_binary_command("sign", [
+  // Tier A: Go binary with optional --serial/--reader targeting
+  const sign_args = [
     "--nonce", nonce_b64,
     "--type", "yubikey",
-  ]);
+  ];
+  if (piv_serial_number !== undefined) {
+    sign_args.push("--serial", String(piv_serial_number));
+  } else if (piv_reader_name_substring !== undefined) {
+    sign_args.push("--reader", piv_reader_name_substring);
+  }
+
+  try {
+    return await run_binary_command("sign", sign_args);
+  } catch (tier_a_error: any) {
+    // If Go binary is available but signing failed for a non-binary reason,
+    // and Tier B isn't available, re-throw immediately
+    if (!(tier_a_error instanceof BinaryNotFoundError)) {
+      // Hardware error from Go binary -- try Tier B as fallback only if available
+      if (!is_tier_b_piv_via_smartcard_available()) {
+        throw tier_a_error;
+      }
+      // Tier A had a hardware error, try Tier B (different code path may succeed)
+    }
+  }
+
+  // Tier B: smartcard npm package direct signing
+  if (!is_tier_b_piv_via_smartcard_available()) {
+    throw new BinaryNotFoundError(
+      "oneid-enroll binary not found and the 'smartcard' npm package is not "
+      + "installed for Tier B PIV signing. Install either the Go binary or "
+      + "the smartcard package: npm install smartcard"
+    );
+  }
+
+  // Enumerate and select target YubiKey
+  const available_yubikeys = await enumerate_all_piv_capable_yubikeys_via_smartcard();
+
+  if (available_yubikeys.length === 0) {
+    throw new NoHSMError("No PIV-capable YubiKeys found via PC/SC (Tier B)");
+  }
+
+  const target_reader_name = select_preferred_piv_yubikey_reader_name(
+    available_yubikeys,
+    piv_serial_number,
+  );
+  if (target_reader_name == null) {
+    throw new NoHSMError(
+      piv_serial_number !== undefined
+        ? `YubiKey with serial ${piv_serial_number} not found among ${available_yubikeys.length} connected key(s)`
+        : `No suitable YubiKey could be selected from ${available_yubikeys.length} connected key(s)`,
+    );
+  }
+
+  const nonce_bytes = Buffer.from(nonce_b64, "base64");
+  return sign_nonce_with_specific_piv_reader_via_smartcard(nonce_bytes, target_reader_name);
 }
 
 /**
@@ -470,6 +638,8 @@ export async function sign_challenge_with_piv(
  *
  * This is the core of ongoing TPM-backed authentication.
  */
+// CROSS_IMPL_SYNC: tpm_sign
+// Implementations: py:oneid/helper.py go:internal/tpm/sign.go node:src/helper.ts
 export async function sign_challenge_with_tpm(
   nonce_b64: string,
   ak_handle: string,
@@ -535,6 +705,8 @@ function find_secure_enclave_helper_binary(): string | null {
  * issue after prolonged uptime), the SDK automatically kills and restarts
  * the daemon, then retries the operation.
  */
+// CROSS_IMPL_SYNC: enclave_sign
+// Implementations: py:oneid/helper.py go:internal/enclave/sign_darwin.go node:src/helper.ts
 export async function sign_challenge_with_enclave(
   nonce_b64: string,
 ): Promise<Record<string, unknown>> {
@@ -570,4 +742,445 @@ export async function sign_challenge_with_enclave(
   }
 
   throw new HSMAccessError("oneid-se-helper sign failed after ctkd recovery retry");
+}
+
+// ---------------------------------------------------------------------------
+// Tier B: Pure-Node PIV signing via the 'smartcard' npm package (optional).
+// When 'smartcard' is installed, these functions provide multi-YubiKey
+// enumeration, serial-based selection, and direct PIV APDU signing -- all
+// without the Go binary.
+//
+// CROSS_IMPL_SYNC: piv_multi_key
+// Implementations: py:oneid/helper.py go:internal/piv/connection.go node:src/helper.ts
+// ---------------------------------------------------------------------------
+
+const PIV_AID_FOR_APPLET_SELECT = [0xA0, 0x00, 0x00, 0x03, 0x08];
+const YUBIKEY_MANAGEMENT_AID_FOR_SERIAL_AND_FIRMWARE = [
+  0xA0, 0x00, 0x00, 0x05, 0x27, 0x47, 0x11, 0x17,
+];
+
+/**
+ * Result of enumerating a single PIV-capable YubiKey via PC/SC.
+ */
+export interface EnumeratedYubiKeyInfo {
+  reader_name: string;
+  serial_number: number | null;
+  firmware_version: string | null;
+  piv_slot_9a_has_signing_key: boolean;
+  pcsc_enumeration_index: number;
+}
+
+/**
+ * Try to load the optional 'smartcard' npm package.
+ * Returns null if not installed.
+ */
+function _try_load_smartcard_module(): any | null {
+  try {
+    return require("smartcard");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse TLV response from YubiKey management GET DEVICE INFO command.
+ * Extracts serial number and firmware version.
+ *
+ * Tag 0x02 = serial (4 bytes big-endian)
+ * Tag 0x05 = firmware version (3 bytes: major.minor.patch)
+ */
+function _parse_yubikey_management_device_info_tlv_for_serial_and_firmware(
+  raw_data: Buffer,
+): { serial: number | null; firmware: string | null } {
+  let serial: number | null = null;
+  let firmware: string | null = null;
+
+  if (raw_data.length < 3) { return { serial, firmware }; }
+
+  // First byte is the total length of TLV data; skip it
+  let pos = 1;
+  while (pos + 2 <= raw_data.length) {
+    const tag = raw_data[pos];
+    const len = raw_data[pos + 1];
+    pos += 2;
+    if (pos + len > raw_data.length) { break; }
+
+    if (tag === 0x02 && len === 4) {
+      serial = raw_data.readUInt32BE(pos);
+    } else if (tag === 0x05 && len === 3) {
+      firmware = `${raw_data[pos]}.${raw_data[pos + 1]}.${raw_data[pos + 2]}`;
+    }
+    pos += len;
+  }
+
+  return { serial, firmware };
+}
+
+/**
+ * Parse the ASN.1/BER length field at the given offset.
+ * Returns [length_value, new_offset].
+ */
+function _parse_asn1_length(data: Buffer, offset: number): [number, number] {
+  if (offset >= data.length) {
+    throw new HSMAccessError(`ASN.1 length parse: offset ${offset} beyond data`);
+  }
+  const first_byte = data[offset];
+  if (first_byte < 0x80) {
+    return [first_byte, offset + 1];
+  }
+  const num_length_bytes = first_byte & 0x7F;
+  if (num_length_bytes === 0 || offset + 1 + num_length_bytes > data.length) {
+    throw new HSMAccessError("ASN.1 length parse: invalid multi-byte length");
+  }
+  let length_value = 0;
+  for (let i = 0; i < num_length_bytes; i++) {
+    length_value = (length_value << 8) | data[offset + 1 + i];
+  }
+  return [length_value, offset + 1 + num_length_bytes];
+}
+
+/**
+ * Extract the DER signature bytes from a PIV GENERAL AUTHENTICATE response.
+ * Response is TLV: tag 0x7C containing tag 0x82 with the signature.
+ */
+function _extract_signature_from_general_authenticate_response(
+  raw_response: Buffer,
+): Buffer {
+  if (raw_response.length < 4) {
+    throw new HSMAccessError(
+      `PIV GENERAL AUTHENTICATE response too short: ${raw_response.length} bytes`
+    );
+  }
+  if (raw_response[0] !== 0x7C) {
+    throw new HSMAccessError(
+      `Unexpected PIV response tag: 0x${raw_response[0].toString(16)} (expected 0x7C)`
+    );
+  }
+
+  let pos = 1;
+  const [, pos_after_outer] = _parse_asn1_length(raw_response, pos);
+  pos = pos_after_outer;
+
+  if (pos >= raw_response.length || raw_response[pos] !== 0x82) {
+    throw new HSMAccessError(
+      `Unexpected inner PIV response tag: 0x${(raw_response[pos] ?? 0).toString(16)} (expected 0x82)`
+    );
+  }
+  pos += 1;
+  const [sig_len, pos_after_sig_len] = _parse_asn1_length(raw_response, pos);
+  pos = pos_after_sig_len;
+
+  const signature_bytes = raw_response.subarray(pos, pos + sig_len);
+  if (signature_bytes.length !== sig_len) {
+    throw new HSMAccessError(
+      `Truncated PIV signature: expected ${sig_len} bytes, got ${signature_bytes.length}`
+    );
+  }
+  return signature_bytes;
+}
+
+/**
+ * Check whether the 'smartcard' npm package is available for Tier B operations.
+ */
+export function is_tier_b_piv_via_smartcard_available(): boolean {
+  return _try_load_smartcard_module() !== null;
+}
+
+/**
+ * Enumerate all connected YubiKeys that have a PIV applet, via PC/SC.
+ *
+ * Uses the 'smartcard' npm package (optional dependency) to access PC/SC
+ * readers directly from Node.js without the Go binary.
+ *
+ * For each reader that looks like a YubiKey (name contains "yubi" or "ccid"),
+ * connects and probes: PIV applet presence, slot 9a key, serial number,
+ * firmware version.
+ *
+ * Requires: npm install smartcard
+ */
+// CROSS_IMPL_SYNC: piv_multi_key
+// Implementations: py:oneid/helper.py go:internal/piv/connection.go node:src/helper.ts
+export async function enumerate_all_piv_capable_yubikeys_via_smartcard(): Promise<EnumeratedYubiKeyInfo[]> {
+  const smartcard_module = _try_load_smartcard_module();
+  if (smartcard_module == null) {
+    throw new HSMAccessError(
+      "The 'smartcard' npm package is required for Tier B PIV operations. "
+      + "Install with: npm install smartcard"
+    );
+  }
+
+  const { Context, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T0, SCARD_PROTOCOL_T1, SCARD_LEAVE_CARD } = smartcard_module;
+  const ctx = new Context();
+  const detected_yubikeys: EnumeratedYubiKeyInfo[] = [];
+
+  try {
+    const all_readers = ctx.listReaders();
+    let enumeration_index = 0;
+
+    for (const reader of all_readers) {
+      const reader_name_lower = reader.name.toLowerCase();
+      if (!reader_name_lower.includes("yubi") && !reader_name_lower.includes("ccid")) {
+        continue;
+      }
+      enumeration_index++;
+
+      const entry: EnumeratedYubiKeyInfo = {
+        reader_name: reader.name,
+        serial_number: null,
+        firmware_version: null,
+        piv_slot_9a_has_signing_key: false,
+        pcsc_enumeration_index: enumeration_index,
+      };
+
+      try {
+        const card = await reader.connect(
+          SCARD_SHARE_SHARED,
+          SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
+        );
+
+        try {
+          // Step 1: SELECT management applet for serial/firmware (do first
+          // because SELECT PIV later will deselect management)
+          const select_mgmt_apdu = Buffer.from([
+            0x00, 0xA4, 0x04, 0x00,
+            YUBIKEY_MANAGEMENT_AID_FOR_SERIAL_AND_FIRMWARE.length,
+            ...YUBIKEY_MANAGEMENT_AID_FOR_SERIAL_AND_FIRMWARE,
+          ]);
+          const mgmt_response = await card.transmit(select_mgmt_apdu);
+          const mgmt_sw = mgmt_response.readUInt16BE(mgmt_response.length - 2);
+
+          if (mgmt_sw === 0x9000) {
+            const get_info_apdu = Buffer.from([0x00, 0x1D, 0x00, 0x00]);
+            const info_response = await card.transmit(get_info_apdu);
+            const info_sw = info_response.readUInt16BE(info_response.length - 2);
+
+            if (info_sw === 0x9000 && info_response.length > 2) {
+              const info_data = info_response.subarray(0, info_response.length - 2);
+              const parsed = _parse_yubikey_management_device_info_tlv_for_serial_and_firmware(info_data);
+              entry.serial_number = parsed.serial;
+              entry.firmware_version = parsed.firmware;
+            }
+          }
+
+          // Step 2: SELECT PIV applet
+          const select_piv_apdu = Buffer.from([
+            0x00, 0xA4, 0x04, 0x00,
+            PIV_AID_FOR_APPLET_SELECT.length,
+            ...PIV_AID_FOR_APPLET_SELECT,
+          ]);
+          const piv_response = await card.transmit(select_piv_apdu);
+          const piv_sw = piv_response.readUInt16BE(piv_response.length - 2);
+
+          if (piv_sw === 0x9000) {
+            // Step 3: Probe slot 9a with GENERAL AUTHENTICATE (same as Python).
+            // If the key exists, we get 0x9000 + a signature. If not, 0x6A80.
+            const probe_hash = crypto.createHash("sha256").update("phase4-slot-probe").digest();
+            const probe_apdu = Buffer.from([
+              0x00, 0x87, 0x11, 0x9A, 0x26,
+              0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+              ...probe_hash,
+            ]);
+            const probe_response = await card.transmit(probe_apdu, { maxRecvLength: 512 });
+            const probe_sw = probe_response.readUInt16BE(probe_response.length - 2);
+            if (probe_sw === 0x9000) {
+              entry.piv_slot_9a_has_signing_key = true;
+            }
+          }
+
+          card.disconnect(SCARD_LEAVE_CARD);
+        } catch {
+          try { card.disconnect(SCARD_LEAVE_CARD); } catch { /* ignore */ }
+        }
+      } catch {
+        // Cannot connect to this reader (no card present, locked, etc.)
+      }
+
+      detected_yubikeys.push(entry);
+    }
+  } finally {
+    ctx.close();
+  }
+
+  return detected_yubikeys;
+}
+
+/**
+ * Choose which YubiKey reader to use for PIV signing.
+ *
+ * Priority order (production-ready, matches Python implementation):
+ *   1. Explicit serial override -- caller knows which key they want
+ *   2. Registered device match -- the serial from credentials/database
+ *   3. Most-recently-plugged heuristic -- LAST in PC/SC enumeration
+ *      among keys that have a functioning slot 9a key
+ *   4. If no key has slot 9a populated, pick the last enumerated anyway
+ *   5. Single YubiKey -- no ambiguity, use it
+ */
+export function select_preferred_piv_yubikey_reader_name(
+  available_yubikeys: EnumeratedYubiKeyInfo[],
+  preferred_serial_number?: number,
+  registered_piv_device_serial_number?: number,
+): string | null {
+  if (available_yubikeys.length === 0) { return null; }
+
+  if (available_yubikeys.length === 1) {
+    return available_yubikeys[0].reader_name;
+  }
+
+  // Priority 1: Explicit serial override
+  if (preferred_serial_number !== undefined) {
+    for (const yk of available_yubikeys) {
+      if (yk.serial_number === preferred_serial_number) {
+        return yk.reader_name;
+      }
+    }
+    return null;
+  }
+
+  // Priority 2: Registered device match
+  if (registered_piv_device_serial_number !== undefined) {
+    for (const yk of available_yubikeys) {
+      if (yk.serial_number === registered_piv_device_serial_number) {
+        return yk.reader_name;
+      }
+    }
+  }
+
+  // Priority 3: Last-enumerated key WITH a slot 9a key (most-recently-plugged)
+  const yubikeys_with_signing_key = available_yubikeys.filter(
+    (yk) => yk.piv_slot_9a_has_signing_key,
+  );
+  if (yubikeys_with_signing_key.length > 0) {
+    return yubikeys_with_signing_key[yubikeys_with_signing_key.length - 1].reader_name;
+  }
+
+  // Priority 4: Last-enumerated key (for enrollment or fresh setup)
+  return available_yubikeys[available_yubikeys.length - 1].reader_name;
+}
+
+/**
+ * Sign a nonce using PIV slot 9a on a specific PC/SC reader.
+ *
+ * Pure Node.js implementation via the 'smartcard' npm package APDUs.
+ * Does NOT use the Go binary. This enables signing with a specific
+ * YubiKey when multiple are connected (Tier B).
+ *
+ * The nonce is SHA-256 hashed before sending to the card (matching
+ * the Go binary's behavior for ECDSA-SHA256).
+ */
+export async function sign_nonce_with_specific_piv_reader_via_smartcard(
+  nonce_bytes: Buffer,
+  reader_name: string,
+): Promise<Record<string, unknown>> {
+  const smartcard_module = _try_load_smartcard_module();
+  if (smartcard_module == null) {
+    throw new HSMAccessError(
+      "The 'smartcard' npm package is required for Tier B PIV signing. "
+      + "Install with: npm install smartcard"
+    );
+  }
+
+  const { Context, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T0, SCARD_PROTOCOL_T1, SCARD_LEAVE_CARD } = smartcard_module;
+  const ctx = new Context();
+
+  try {
+    const all_readers = ctx.listReaders();
+    const target_reader = all_readers.find((r: any) => r.name === reader_name);
+    if (target_reader == null) {
+      throw new NoHSMError(`PC/SC reader not found: ${reader_name}`);
+    }
+
+    const card = await target_reader.connect(
+      SCARD_SHARE_SHARED,
+      SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
+    );
+
+    try {
+      // SELECT PIV applet
+      const select_piv_apdu = Buffer.from([
+        0x00, 0xA4, 0x04, 0x00,
+        PIV_AID_FOR_APPLET_SELECT.length,
+        ...PIV_AID_FOR_APPLET_SELECT,
+      ]);
+      const piv_response = await card.transmit(select_piv_apdu);
+      const piv_sw = piv_response.readUInt16BE(piv_response.length - 2);
+      if (piv_sw !== 0x9000) {
+        throw new HSMAccessError(
+          `PIV applet selection failed: SW=${piv_sw.toString(16).padStart(4, "0")}`
+        );
+      }
+
+      // Hash the nonce (matching Go binary: ECDSA-SHA256)
+      const digest_32_bytes = crypto.createHash("sha256").update(nonce_bytes).digest();
+
+      // GENERAL AUTHENTICATE: P1=0x11 (ECC P-256), P2=0x9A (slot 9a)
+      // Data: 7C 24 82 00 81 20 [32 bytes hash]
+      const sign_apdu = Buffer.from([
+        0x00, 0x87, 0x11, 0x9A, 0x26,
+        0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+        ...digest_32_bytes,
+      ]);
+      const sign_response = await card.transmit(sign_apdu, { maxRecvLength: 512 });
+      const sign_sw = sign_response.readUInt16BE(sign_response.length - 2);
+
+      if (sign_sw === 0x6982) {
+        throw new HSMAccessError(
+          "PIV slot 9a requires PIN verification (pin-policy is not NEVER). "
+          + "This YubiKey may not be configured for agent use."
+        );
+      }
+      if (sign_sw === 0x6A80) {
+        throw new HSMAccessError(
+          "No key in PIV slot 9a on this YubiKey. "
+          + "The key may not be enrolled or may need setup."
+        );
+      }
+      if (sign_sw !== 0x9000) {
+        throw new HSMAccessError(
+          `PIV signing failed: SW=${sign_sw.toString(16).padStart(4, "0")}`
+        );
+      }
+
+      // Parse response TLV: 7C [len] 82 [len] [signature bytes]
+      const raw_sign_data = sign_response.subarray(0, sign_response.length - 2);
+      const signature_der_bytes = _extract_signature_from_general_authenticate_response(raw_sign_data);
+
+      // Get serial number for the response
+      let serial_str = "";
+      try {
+        const select_mgmt = Buffer.from([
+          0x00, 0xA4, 0x04, 0x00,
+          YUBIKEY_MANAGEMENT_AID_FOR_SERIAL_AND_FIRMWARE.length,
+          ...YUBIKEY_MANAGEMENT_AID_FOR_SERIAL_AND_FIRMWARE,
+        ]);
+        const mgmt_resp = await card.transmit(select_mgmt);
+        const mgmt_sw = mgmt_resp.readUInt16BE(mgmt_resp.length - 2);
+        if (mgmt_sw === 0x9000) {
+          const info_resp = await card.transmit(Buffer.from([0x00, 0x1D, 0x00, 0x00]));
+          const info_sw = info_resp.readUInt16BE(info_resp.length - 2);
+          if (info_sw === 0x9000 && info_resp.length > 2) {
+            const parsed = _parse_yubikey_management_device_info_tlv_for_serial_and_firmware(
+              info_resp.subarray(0, info_resp.length - 2),
+            );
+            if (parsed.serial != null) { serial_str = String(parsed.serial); }
+          }
+        }
+      } catch { /* serial is best-effort */ }
+
+      card.disconnect(SCARD_LEAVE_CARD);
+      ctx.close();
+
+      return {
+        signature_b64: signature_der_bytes.toString("base64"),
+        algorithm: "ECDSA-SHA256",
+        serial_number: serial_str,
+      };
+    } catch (err) {
+      try { card.disconnect(SCARD_LEAVE_CARD); } catch { /* ignore */ }
+      throw err;
+    }
+  } catch (err) {
+    ctx.close();
+    if (err instanceof NoHSMError || err instanceof HSMAccessError) { throw err; }
+    throw new HSMAccessError(`Unexpected PIV signing error: ${(err as Error).message ?? err}`);
+  }
 }

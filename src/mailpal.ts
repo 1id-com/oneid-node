@@ -30,6 +30,7 @@
  *   receiving milter will verify, eliminating canonicalization mismatches.
  */
 
+import { SDK_USER_AGENT } from "./version.js";
 import * as net from "node:net";
 import * as tls from "node:tls";
 import * as crypto from "node:crypto";
@@ -41,6 +42,8 @@ import { type StoredCredentials, load_credentials, save_credentials } from "./cr
 import {
   prepareAttestation,
   prepare_direct_hardware_attestation,
+  public_key_jwk_of_certificate_chain_leaf,
+  _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING,
   type AttestationProof,
   type DirectAttestationProof,
 } from "./attestation.js";
@@ -48,7 +51,7 @@ import { AuthenticationError, NetworkError, NotEnrolledError } from "./exception
 
 const _MAILPAL_API_BASE_URL = "https://mailpal.com";
 const _HTTP_TIMEOUT_MILLISECONDS = 30_000;
-const _USER_AGENT = "oneid-sdk-node/1.2.1";
+const _USER_AGENT = SDK_USER_AGENT;
 const _SMTP_HOST = "smtp.mailpal.com";
 const _SMTP_PORT_STARTTLS = 587;
 const _SMTP_TIMEOUT_MILLISECONDS = 30_000;
@@ -397,21 +400,112 @@ function _extract_body_bytes_from_wire_format(wire_bytes: Buffer): Buffer {
   return wire_bytes.subarray(separator_index + 4);
 }
 
-function _fold_long_header_value_for_smtp_transmission(
+export function _fold_long_header_value_for_smtp_transmission(
   header_name: string,
   header_value: string,
 ): string {
-  const full_line = `${header_name}: ${header_value}`;
-  if (full_line.length <= 76) { return full_line; }
-  const first_line = full_line.substring(0, 76);
-  let remaining = full_line.substring(76);
-  const lines = [first_line];
-  while (remaining.length > 0) {
-    const chunk = remaining.substring(0, 75);
-    lines.push("\t" + chunk);
-    remaining = remaining.substring(75);
+  const preferred_physical_line_length = 78;
+  const hard_maximum_physical_line_length = 998;
+  const lowercase_header_name = header_name.toLowerCase();
+  let folded_physical_lines: string[];
+
+  if (lowercase_header_name === "hardware-trust-proof") {
+    // This field's ABNF permits transport FWS at every SD-JWT character
+    // boundary, so fixed-size encoded chunks are grammar-safe.
+    folded_physical_lines = [];
+    let remaining_encoded_value = header_value;
+    let next_line_prefix = `${header_name}: `;
+    while (remaining_encoded_value.length > 0) {
+      const available_character_count = preferred_physical_line_length - next_line_prefix.length;
+      const encoded_value_chunk = remaining_encoded_value.substring(0, available_character_count);
+      folded_physical_lines.push(next_line_prefix + encoded_value_chunk);
+      remaining_encoded_value = remaining_encoded_value.substring(encoded_value_chunk.length);
+      next_line_prefix = " ";
+    }
+    if (folded_physical_lines.length === 0) { folded_physical_lines = [`${header_name}: `]; }
+  } else if (lowercase_header_name === "hardware-attestation") {
+    // Keep tokens intact: split tags at semicolons, h= only at colon
+    // separators, and chain=/bind= only where encoded-value FWS is legal.
+    const parameter_segments = header_value.split(";").map(
+      parameter_segment => parameter_segment.replace(/^[ \t]+|[ \t]+$/g, "")
+    );
+    if (parameter_segments.some(parameter_segment => !parameter_segment || !parameter_segment.includes("="))) {
+      throw new Error("Hardware-Attestation contains an invalid parameter segment");
+    }
+    folded_physical_lines = [];
+    for (let parameter_segment_index = 0; parameter_segment_index < parameter_segments.length; parameter_segment_index++) {
+      const parameter_segment = parameter_segments[parameter_segment_index]!;
+      const equals_position = parameter_segment.indexOf("=");
+      const parameter_name = parameter_segment.substring(0, equals_position);
+      const parameter_value = parameter_segment.substring(equals_position + 1);
+      const physical_line_prefix = parameter_segment_index === 0 ? `${header_name}: ` : " ";
+      let parameter_physical_lines: string[];
+
+      if (parameter_name === "h") {
+        const signed_header_names = parameter_value.split(":");
+        if (signed_header_names.some(signed_header_name => !signed_header_name)) {
+          throw new Error("Hardware-Attestation h parameter contains an empty field name");
+        }
+        parameter_physical_lines = [];
+        let current_physical_line = physical_line_prefix + "h=" + signed_header_names[0]!;
+        for (const signed_header_name of signed_header_names.slice(1)) {
+          const next_header_name_with_separator = ":" + signed_header_name;
+          if (current_physical_line.length + next_header_name_with_separator.length <= preferred_physical_line_length) {
+            current_physical_line += next_header_name_with_separator;
+          } else {
+            parameter_physical_lines.push(current_physical_line + ":");
+            current_physical_line = " " + signed_header_name;
+          }
+        }
+        parameter_physical_lines.push(current_physical_line);
+      } else if (parameter_name === "chain" || parameter_name === "bind") {
+        parameter_physical_lines = [];
+        let remaining_encoded_value = parameter_value;
+        let next_encoded_line_prefix = physical_line_prefix + parameter_name + "=";
+        while (remaining_encoded_value.length > 0) {
+          const available_character_count = preferred_physical_line_length - next_encoded_line_prefix.length;
+          const encoded_value_chunk = remaining_encoded_value.substring(0, available_character_count);
+          parameter_physical_lines.push(next_encoded_line_prefix + encoded_value_chunk);
+          remaining_encoded_value = remaining_encoded_value.substring(encoded_value_chunk.length);
+          next_encoded_line_prefix = " ";
+        }
+        if (parameter_physical_lines.length === 0) { parameter_physical_lines = [next_encoded_line_prefix]; }
+      } else {
+        parameter_physical_lines = [physical_line_prefix + parameter_segment];
+      }
+
+      if (parameter_segment_index < parameter_segments.length - 1) {
+        parameter_physical_lines[parameter_physical_lines.length - 1] += ";";
+      }
+      folded_physical_lines.push(...parameter_physical_lines);
+    }
+  } else {
+    const full_line = `${header_name}: ${header_value}`;
+    if (full_line.length > hard_maximum_physical_line_length) {
+      throw new Error(`No legal AIRS folding rule is defined for ${header_name}`);
+    }
+    folded_physical_lines = [full_line];
   }
-  return lines.join("\r\n");
+
+  if (folded_physical_lines.some(physical_line => physical_line.length > hard_maximum_physical_line_length)) {
+    throw new Error(
+      `Folded ${header_name} contains a physical line longer than ${hard_maximum_physical_line_length} characters`
+    );
+  }
+  return folded_physical_lines.join("\r\n");
+}
+
+function _assemble_hardware_trust_proof_presentation_value(
+  mode2_sd_jwt_proof: AttestationProof,
+): string | null {
+  if (!mode2_sd_jwt_proof.sd_jwt) { return null; }
+  let sd_jwt_presentation_value = mode2_sd_jwt_proof.sd_jwt;
+  const disclosure_values = Object.values(mode2_sd_jwt_proof.sd_jwt_disclosures);
+  for (const disclosure_b64url of disclosure_values) {
+    sd_jwt_presentation_value += "~" + disclosure_b64url;
+  }
+  if (disclosure_values.length > 0) { sd_jwt_presentation_value += "~"; }
+  return sd_jwt_presentation_value;
 }
 
 function _inject_attestation_headers_into_wire_bytes(
@@ -965,7 +1059,9 @@ export async function send(options: SendOptions): Promise<SendResult> {
     wire_format_message_bytes,
   );
 
-  const _MODE2_REQUIRED_HEADER_NAMES = new Set(["from", "to", "subject", "date", "message-id"]);
+  // Email draft: Mode 2 always covers the nine fields (REC-04); a five-field
+  // subset here made every sent Mode 2 nonce mismatch the delivered message.
+  const _MODE2_REQUIRED_HEADER_NAMES = new Set(_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING);
   const wire_format_headers_for_mode2_nonce: Record<string, string> = {};
   for (const [key, value] of Object.entries(wire_format_headers)) {
     if (_MODE2_REQUIRED_HEADER_NAMES.has(key)) {
@@ -976,20 +1072,51 @@ export async function send(options: SendOptions): Promise<SendResult> {
   // -- Phase 3: Compute attestation from wire-format bytes --
   let mode2_sd_jwt_proof: AttestationProof | null = null;
   let mode1_direct_attestation_proof: DirectAttestationProof | null = null;
+  let folded_hardware_trust_proof_header_line: string | null = null;
   const include_sd_jwt_mode = attestation_mode === "sd-jwt" || attestation_mode === "both";
   const include_direct_mode = attestation_mode === "direct" || attestation_mode === "both";
 
+  // AUD-F47: in Combined mode the Mode 2 issuance carries the Mode 1 proof key
+  // as cnf.jwk. (Node sends no Registrar binding, so its Mode 1 carries no aid
+  // and Mode 2 needs no sub disclosure; AUD-F48 applies only with a binding.)
+  const combined_mode_is_requested = include_sd_jwt_mode && include_direct_mode;
+  const combined_mode_proof_key_jwk = combined_mode_is_requested && creds.identity_certificate_chain_pem
+    ? public_key_jwk_of_certificate_chain_leaf(creds.identity_certificate_chain_pem)
+    : null;
+  const request_and_fold_mode2_proof = async (
+    cnf_jwk_for_combined_mode: Record<string, unknown> | null,
+  ): Promise<[AttestationProof, string | null]> => {
+    const issued_proof = await prepareAttestation({
+      emailHeaders: wire_format_headers_for_mode2_nonce,
+      body: wire_format_body_bytes,
+      disclosedClaims: disclosed_claims ?? undefined,
+      apiBaseUrl: oneid_api_url ?? undefined,
+      cnfJwk: cnf_jwk_for_combined_mode ?? undefined,
+    });
+    const presentation_value = _assemble_hardware_trust_proof_presentation_value(issued_proof);
+    const folded_line = presentation_value
+      ? _fold_long_header_value_for_smtp_transmission("Hardware-Trust-Proof", presentation_value)
+      : null;
+    return [issued_proof, folded_line];
+  };
+
+  let mode2_carries_combined_mode_cnf = false;
   if (effective_include_attestation && include_sd_jwt_mode) {
     try {
-      mode2_sd_jwt_proof = await prepareAttestation({
-        emailHeaders: wire_format_headers_for_mode2_nonce,
-        body: wire_format_body_bytes,
-        disclosedClaims: disclosed_claims ?? undefined,
-        apiBaseUrl: oneid_api_url ?? undefined,
-      });
+      [mode2_sd_jwt_proof, folded_hardware_trust_proof_header_line] =
+        await request_and_fold_mode2_proof(combined_mode_proof_key_jwk);
+      mode2_carries_combined_mode_cnf = combined_mode_proof_key_jwk !== null;
     } catch (attestation_error) {
       console.warn(`[oneid.mailpal] Mode 2 (SD-JWT) attestation failed: ${attestation_error}`);
     }
+  }
+
+  if (folded_hardware_trust_proof_header_line) {
+    // Combined Mode signs the exact folded Mode-2 field that will be emitted.
+    const header_value_separator_position = folded_hardware_trust_proof_header_line.indexOf(":");
+    wire_format_headers["hardware-trust-proof"] = folded_hardware_trust_proof_header_line.substring(
+      header_value_separator_position + 1
+    );
   }
 
   if (effective_include_attestation && include_direct_mode) {
@@ -1002,8 +1129,33 @@ export async function send(options: SendOptions): Promise<SendResult> {
     }
   }
 
+  // INV-E3: a Mode 2 proof carrying the Combined-mode cnf must never travel
+  // without its Mode 1 (verifiers must reject that rather than degrade): if
+  // Mode 1 failed, replace it with a standalone Mode 2 (cnf absent).
+  if (mode2_carries_combined_mode_cnf && mode1_direct_attestation_proof === null) {
+    try {
+      [mode2_sd_jwt_proof, folded_hardware_trust_proof_header_line] = await request_and_fold_mode2_proof(null);
+    } catch (mode2_retry_error) {
+      console.warn(`[oneid.mailpal] Standalone Mode 2 fallback failed: ${mode2_retry_error}`);
+      mode2_sd_jwt_proof = null;
+      folded_hardware_trust_proof_header_line = null;
+    }
+  }
+
   // -- Phase 4: Build attestation header lines --
   const attestation_header_lines_to_inject: string[] = [];
+
+  if (mode2_sd_jwt_proof) {
+    if (folded_hardware_trust_proof_header_line) {
+      // Emit Mode 2 before the Mode-1 proof that cryptographically covers it.
+      attestation_header_lines_to_inject.push(folded_hardware_trust_proof_header_line);
+    }
+    if (mode2_sd_jwt_proof.contact_token) {
+      attestation_header_lines_to_inject.push(
+        `X-1ID-Contact-Token: ${mode2_sd_jwt_proof.contact_token}`,
+      );
+    }
+  }
 
   if (mode1_direct_attestation_proof?.hardware_attestation_header_value) {
     attestation_header_lines_to_inject.push(
@@ -1012,29 +1164,6 @@ export async function send(options: SendOptions): Promise<SendResult> {
         mode1_direct_attestation_proof.hardware_attestation_header_value,
       ),
     );
-  }
-
-  if (mode2_sd_jwt_proof) {
-    if (mode2_sd_jwt_proof.sd_jwt) {
-      let sd_jwt_presentation_value = mode2_sd_jwt_proof.sd_jwt;
-      if (mode2_sd_jwt_proof.sd_jwt_disclosures &&
-          Object.keys(mode2_sd_jwt_proof.sd_jwt_disclosures).length > 0) {
-        for (const disclosure_b64url of Object.values(mode2_sd_jwt_proof.sd_jwt_disclosures)) {
-          sd_jwt_presentation_value += "~" + disclosure_b64url;
-        }
-        sd_jwt_presentation_value += "~";
-      }
-      attestation_header_lines_to_inject.push(
-        _fold_long_header_value_for_smtp_transmission(
-          "Hardware-Trust-Proof", sd_jwt_presentation_value,
-        ),
-      );
-    }
-    if (mode2_sd_jwt_proof.contact_token) {
-      attestation_header_lines_to_inject.push(
-        `X-1ID-Contact-Token: ${mode2_sd_jwt_proof.contact_token}`,
-      );
-    }
   }
 
   // -- Phase 5: Inject attestation headers --

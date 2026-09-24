@@ -62,7 +62,7 @@ Enroll this agent with 1id.com.
 ```typescript
 const identity = await oneid.enroll({
   request_tier: "declared",           // REQUIRED: trust tier
-  key_algorithm: "ed25519",           // Optional: ed25519 (default), ecdsa-p256, rsa-2048, etc.
+  key_algorithm: "ecdsa-p256",        // Optional: ecdsa-p256 (default; signs email), rsa-2048, ed25519 (auth only)
   requested_handle: "my-agent",       // Optional: vanity handle (without @)
   operator_email: "human@example.com" // Optional: human contact
 });

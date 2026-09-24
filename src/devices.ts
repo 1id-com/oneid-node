@@ -200,8 +200,13 @@ export async function addDevice(
 
   const current_tier = credentials.trust_tier;
 
-  if (current_tier === "declared" || !credentials.hsm_key_reference) {
-    return _add_device_via_declared_to_hardware_upgrade(device_type ?? null, credentials);
+  // TPM additions always use the authenticated two-step possession ceremony,
+  // including when an existing hardware identity is adding another TPM.
+  if (current_tier === "declared" || !credentials.hsm_key_reference || device_type === "tpm") {
+    return _add_device_using_authenticated_identity_evidence_and_tpm_credential_activation_when_required(
+      device_type ?? null,
+      credentials,
+    );
   }
 
   if (!existing_device_fingerprint || !existing_device_type) {
@@ -222,7 +227,7 @@ export async function addDevice(
 }
 
 
-async function _add_device_via_declared_to_hardware_upgrade(
+async function _add_device_using_authenticated_identity_evidence_and_tpm_credential_activation_when_required(
   device_type_preference: string | null,
   credentials: StoredCredentials,
 ): Promise<DeviceAddResult> {
@@ -292,9 +297,33 @@ async function _add_device_via_declared_to_hardware_upgrade(
 
   const token = await get_token(false, credentials);
   const api_client = new OneIDAPIClient(credentials.api_base_url);
-  const response_data = await api_client.make_authenticated_request(
-    "POST", "/api/v1/identity/devices/add", token.access_token, request_body,
-  );
+  let response_data: Record<string, unknown>;
+  if (hsm_type === "tpm") {
+    // An EK certificate is public evidence, so prove control of its private key
+    // by activating the server challenge before the TPM anchor is registered.
+    const begin_binding_response_data = await api_client.make_authenticated_request(
+      "POST", "/api/v1/identity/devices/add/tpm/begin", token.access_token, request_body,
+    );
+    _raise_from_device_api_error_code(begin_binding_response_data);
+
+    const { activate_credential } = await import("./helper.js");
+    const decrypted_credential_b64 = await activate_credential(
+      selected_hsm,
+      begin_binding_response_data.credential_blob as string,
+      begin_binding_response_data.encrypted_secret as string,
+      (attestation_data.ak_handle as string) ?? "",
+    );
+    response_data = await api_client.make_authenticated_request(
+      "POST", "/api/v1/identity/devices/add/tpm/activate", token.access_token, {
+        binding_session_id: begin_binding_response_data.binding_session_id,
+        decrypted_credential: decrypted_credential_b64,
+      },
+    );
+  } else {
+    response_data = await api_client.make_authenticated_request(
+      "POST", "/api/v1/identity/devices/add", token.access_token, request_body,
+    );
+  }
   _raise_from_device_api_error_code(response_data);
 
   const new_tier = (response_data.trust_tier ?? (hsm_type === "tpm" ? "sovereign" : "portable")) as string;

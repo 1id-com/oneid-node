@@ -17,6 +17,7 @@
  * and enrolls at the highest available trust tier.
  */
 
+import { SDK_VERSION } from "./version.js";
 import { clear_cached_token, get_token, authenticate_with_tpm, authenticate_with_piv } from "./auth.js";
 import { credentials_exist, load_credentials, save_credentials } from "./credentials.js";
 import { enroll, type EnrollOptions } from "./enroll.js";
@@ -227,7 +228,7 @@ export const mailpal = {
 };
 
 /** SDK version string. */
-export const VERSION = "1.2.1";
+export const VERSION = SDK_VERSION;
 
 /**
  * Check the current enrolled identity.
