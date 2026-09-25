@@ -287,11 +287,55 @@ async function download_binary_from_github_release(
  * @returns Path to the available binary.
  * @throws BinaryNotFoundError if the binary cannot be found or downloaded.
  */
+/**
+ * 2.2.0: `sign` hashes inputs over 1024 bytes with a TPM hash sequence, which every
+ * sender-constrained request (RFC 9421 signature base, OWN-038) needs; 2.1.0 was the
+ * corrected enrollment proof (review 072 #1).
+ */
+export const MINIMUM_ONEID_ENROLL_HELPER_VERSION: [number, number, number] = [2, 2, 0];
+const helper_versions_already_checked = new Map<string, boolean>();
+
+export function parse_version_triple(version_text: unknown): [number, number, number] {
+  const parts = String(version_text ?? "").trim().replace(/^v/, "").split(".").slice(0, 3).map(Number);
+  if (parts.length !== 3 || parts.some((part) => !Number.isInteger(part))) { return [0, 0, 0]; }
+  return [parts[0], parts[1], parts[2]];
+}
+
+function version_triple_at_least(version: [number, number, number], minimum: [number, number, number]): boolean {
+  for (let index = 0; index < 3; index++) {
+    if (version[index] !== minimum[index]) { return version[index] > minimum[index]; }
+  }
+  return true;
+}
+
+/** OWN-026: run `oneid-enroll version --json` once per (path, mtime); a helper
+ * older than MINIMUM_ONEID_ENROLL_HELPER_VERSION must not be used. */
+export function helper_binary_meets_minimum_version(binary_path: string): boolean {
+  let cache_key: string;
+  try {
+    cache_key = `${binary_path}|${fs.statSync(binary_path).mtimeMs}`;
+  } catch {
+    return false;
+  }
+  if (!helper_versions_already_checked.has(cache_key)) {
+    let reported_version: unknown = null;
+    try {
+      const stdout = child_process.execFileSync(binary_path, ["version", "--json"], { encoding: "utf8", timeout: 15000 });
+      reported_version = JSON.parse(stdout.slice(stdout.indexOf("{"))).version;
+    } catch { reported_version = null; }
+    helper_versions_already_checked.set(cache_key,
+      version_triple_at_least(parse_version_triple(reported_version), MINIMUM_ONEID_ENROLL_HELPER_VERSION));
+  }
+  return helper_versions_already_checked.get(cache_key) === true;
+}
+
 export async function ensure_binary_available(): Promise<string> {
   const found_binary_path = find_binary();
-  if (found_binary_path != null) {
+  if (found_binary_path != null && helper_binary_meets_minimum_version(found_binary_path)) {
     return found_binary_path;
   }
+  // Missing or older than the minimum: download the current release into the
+  // cache (replacing a stale cached copy).
 
   // Binary not found locally -- attempt auto-download
   const binary_name = get_platform_binary_name();

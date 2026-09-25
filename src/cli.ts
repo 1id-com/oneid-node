@@ -4,20 +4,24 @@
  *
  * Usage:
  *     oneid whoami          -- Show enrolled identity info
- *     oneid token           -- Print a fresh bearer token (for scripting)
+ *     oneid token           -- Print a fresh access token (inspection only: sender-constrained)
+ *     oneid request M URL   -- Send an HTTP request signed with your enrolled key
  *     oneid enroll          -- Enroll this machine
  *     oneid status          -- Check if enrolled
  *
  * Examples:
  *     oneid enroll --tier declared --email owner@example.com
- *     TOKEN=$(oneid token)
- *     curl -H "Authorization: Bearer $TOKEN" https://api.example.com/
+ *     # 1ID tokens are sender-constrained (cnf.jwk): every request must carry an
+ *     # RFC 9421 signature by the enrolled key, so curl with a bearer token is refused.
+ *     oneid request GET https://1id.com/api/v1/identity/devices
+ *     oneid request POST https://example.com/api --data '{"hello": "world"}'
  */
 
 import { SDK_VERSION } from "./version.js";
 import { credentials_exist, load_credentials, get_credentials_file_path, delete_credentials } from "./credentials.js";
 import { enroll } from "./enroll.js";
 import { get_token } from "./auth.js";
+import { fetch_with_airs_proof_of_possession } from "./airsHttpMessageSignatures.js";
 import { TrustTier, format_identity_as_display_string } from "./identity.js";
 
 const VERSION = SDK_VERSION;
@@ -29,7 +33,8 @@ Usage: oneid <command> [options]
 
 Commands:
   whoami              Show enrolled identity info
-  token               Print a fresh bearer token
+  token               Print a fresh access token (sender-constrained: use 'request' to call APIs)
+  request M URL       Send an HTTP request signed with your enrolled key [--data JSON]
   enroll              Enroll this machine with 1id.com
   status              Check enrollment status
 
@@ -116,12 +121,44 @@ async function command_token(args: string[]): Promise<number> {
         expires_at: token.expires_at.toISOString(),
       }, null, 2));
     } else {
-      // Raw token for scripting: $(oneid token)
+      // For inspection: the token is sender-constrained, so APIs that verify it
+      // also need a signature by the enrolled key -- use `oneid request`.
       console.log(token.access_token);
     }
     return 0;
   } catch (error: any) {
     console.error(`Authentication failed: ${error.message}`);
+    return 1;
+  }
+}
+
+/** Send one HTTP request, sender-constrained (Authorization + RFC 9421 signature by the enrolled key). */
+async function command_request(args: string[]): Promise<number> {
+  const [method, url] = args;
+  if (!method || !url) {
+    console.error("Usage: oneid request <METHOD> <URL> [--data JSON]");
+    return 2;
+  }
+  const data_index = args.indexOf("--data");
+  const body = data_index >= 0 ? args[data_index + 1] : undefined;
+  if (body !== undefined) {
+    try { JSON.parse(body); } catch (error: any) {
+      console.error(`--data must be JSON: ${error.message}`);
+      return 2;
+    }
+  }
+  try {
+    const token = await get_token();
+    const response = await fetch_with_airs_proof_of_possession(token, url, {
+      method: method.toUpperCase(),
+      headers: body !== undefined ? { "Content-Type": "application/json" } : {},
+      body,
+    });
+    const text = await response.text();
+    process.stdout.write(text.endsWith("\n") ? text : text + "\n");
+    return response.ok ? 0 : 1;
+  } catch (error: any) {
+    console.error(`Request failed: ${error.message}`);
     return 1;
   }
 }
@@ -203,6 +240,9 @@ async function main(): Promise<void> {
       break;
     case "token":
       exit_code = await command_token(command_args);
+      break;
+    case "request":
+      exit_code = await command_request(command_args);
       break;
     case "enroll":
       exit_code = await command_enroll(command_args);

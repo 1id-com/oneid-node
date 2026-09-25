@@ -15,6 +15,8 @@
  */
 
 import { SDK_USER_AGENT } from "./version.js";
+import type { Token } from "./identity.js";
+import { build_sender_constrained_request_headers } from "./airsHttpMessageSignatures.js";
 import * as https from "node:https";
 import * as http from "node:http";
 import { DEFAULT_API_BASE_URL } from "./credentials.js";
@@ -33,34 +35,41 @@ interface RequestOptions {
   path: string;
   json_body?: Record<string, unknown> | null;
   headers?: Record<string, string>;
+  /** Sent sender-constrained: Authorization + an RFC 9421 signature by the enrolled key (OWN-038). */
+  sender_constrained_token?: Token;
 }
 
 /**
  * Make a raw HTTP(S) request and return the parsed JSON body.
  * Uses only Node.js built-in modules.
  */
-function make_http_request(
+async function make_http_request(
   base_url: string,
   options: RequestOptions,
   timeout_milliseconds: number,
 ): Promise<{ status_code: number; body: unknown }> {
+  const url = new URL(options.path, base_url);
+  let request_headers: Record<string, string> = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+    ...options.headers,
+  };
+  let request_body_string: string | undefined;
+  if (options.json_body != null) {
+    request_body_string = JSON.stringify(options.json_body);
+    request_headers["Content-Type"] = "application/json";
+  }
+  if (options.sender_constrained_token) {
+    request_headers = await build_sender_constrained_request_headers(
+      options.sender_constrained_token, options.method, url.href,
+      request_body_string != null ? Buffer.from(request_body_string, "utf8") : null, request_headers);
+  }
+  if (request_body_string != null) {
+    request_headers["Content-Length"] = Buffer.byteLength(request_body_string).toString();
+  }
   return new Promise((resolve, reject) => {
-    const url = new URL(options.path, base_url);
     const is_https = url.protocol === "https:";
     const transport = is_https ? https : http;
-
-    const request_headers: Record<string, string> = {
-      "User-Agent": USER_AGENT,
-      "Accept": "application/json",
-      ...options.headers,
-    };
-
-    let request_body_string: string | undefined;
-    if (options.json_body != null) {
-      request_body_string = JSON.stringify(options.json_body);
-      request_headers["Content-Type"] = "application/json";
-      request_headers["Content-Length"] = Buffer.byteLength(request_body_string).toString();
-    }
 
     const req = transport.request(
       {
@@ -132,10 +141,11 @@ export class OneIDAPIClient {
     api_path: string,
     json_body?: Record<string, unknown> | null,
     headers?: Record<string, string>,
+    sender_constrained_token?: Token,
   ): Promise<Record<string, unknown>> {
     const response = await make_http_request(
       this.api_base_url,
-      { method, path: api_path, json_body, headers },
+      { method, path: api_path, json_body, headers, sender_constrained_token },
       this.timeout_milliseconds,
     );
 
@@ -370,24 +380,6 @@ export class OneIDAPIClient {
   }
 
   /**
-   * Get an OAuth2 access token using the client_credentials grant.
-   *
-   * Routes through the 1id API token proxy (POST /api/v1/auth/token)
-   * which enforces hardware-tier rejection before forwarding to Keycloak.
-   * Direct Keycloak token endpoint access is blocked by nginx (F-05 fix).
-   */
-  async get_token_with_client_credentials(
-    client_id: string,
-    client_secret: string,
-  ): Promise<Record<string, unknown>> {
-    return this._make_request("POST", "/api/v1/auth/token", {
-      grant_type: "client_credentials",
-      client_id,
-      client_secret,
-    });
-  }
-
-  /**
    * Check whether a vanity handle is available.
    */
   async check_handle_availability(handle_name: string): Promise<Record<string, unknown>> {
@@ -395,17 +387,18 @@ export class OneIDAPIClient {
   }
 
   /**
-   * Make an authenticated API request with a Bearer token.
+   * Make an authenticated API request. The Token is sent sender-constrained:
+   * Authorization + an RFC 9421 signature by the enrolled key over exactly this
+   * request (registry-04 "HTTP Message Signatures", OWN-038). A bare access
+   * token string cannot be used: 1id.com refuses bearer presentations.
    * Used by world/status, devices, lock-hardware, and operator-email endpoints.
    */
   async make_authenticated_request(
     method: string,
     api_path: string,
-    access_token: string,
+    token: Token,
     json_body?: Record<string, unknown> | null,
   ): Promise<Record<string, unknown>> {
-    return this._make_request(method, api_path, json_body, {
-      "Authorization": `Bearer ${access_token}`,
-    });
+    return this._make_request(method, api_path, json_body, undefined, token);
   }
 }

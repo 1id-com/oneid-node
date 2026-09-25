@@ -31,9 +31,13 @@ import oneid from "1id";
 const identity = await oneid.enroll({ request_tier: "declared" });
 console.log(`Enrolled as ${identity.handle}`);
 
-// Get an OAuth2 token for authentication
+// Call an API that accepts 1ID tokens. Tokens are sender-constrained (cnf.jwk):
+// each request is signed with your enrolled key (RFC 9421), so a copied token
+// alone is refused. This signs for you:
 const token = await oneid.getToken();
-console.log(`Bearer ${token.access_token}`);
+const response = await oneid.fetch_with_airs_proof_of_possession(
+  token, "https://1id.com/api/v1/identity/devices");
+// From the shell: oneid request GET https://1id.com/api/v1/identity/devices
 
 // Check current identity
 const me = oneid.whoami();
@@ -74,7 +78,7 @@ Get a valid OAuth2 access token (cached, auto-refreshes).
 
 ```typescript
 const token = await oneid.getToken();
-// Use token.access_token as a Bearer token
+// Sender-constrained: send it with oneid.fetch_with_airs_proof_of_possession(token, url, init)
 ```
 
 ### `oneid.whoami()`

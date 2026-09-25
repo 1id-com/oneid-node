@@ -105,7 +105,7 @@ export async function listDevices(
   const response_data = await api_client.make_authenticated_request(
     "GET",
     "/api/v1/identity/devices",
-    token.access_token,
+    token,
   );
 
   const raw_devices = (response_data.devices ?? []) as Record<string, unknown>[];
@@ -160,7 +160,7 @@ export async function lockHardware(
   const lock_data = await api_client.make_authenticated_request(
     "POST",
     "/api/v1/identity/lock-hardware",
-    token.access_token,
+    token,
     {},
   );
 
@@ -302,7 +302,7 @@ async function _add_device_using_authenticated_identity_evidence_and_tpm_credent
     // An EK certificate is public evidence, so prove control of its private key
     // by activating the server challenge before the TPM anchor is registered.
     const begin_binding_response_data = await api_client.make_authenticated_request(
-      "POST", "/api/v1/identity/devices/add/tpm/begin", token.access_token, request_body,
+      "POST", "/api/v1/identity/devices/add/tpm/begin", token, request_body,
     );
     _raise_from_device_api_error_code(begin_binding_response_data);
 
@@ -314,14 +314,14 @@ async function _add_device_using_authenticated_identity_evidence_and_tpm_credent
       (attestation_data.ak_handle as string) ?? "",
     );
     response_data = await api_client.make_authenticated_request(
-      "POST", "/api/v1/identity/devices/add/tpm/activate", token.access_token, {
+      "POST", "/api/v1/identity/devices/add/tpm/activate", token, {
         binding_session_id: begin_binding_response_data.binding_session_id,
         decrypted_credential: decrypted_credential_b64,
       },
     );
   } else {
     response_data = await api_client.make_authenticated_request(
-      "POST", "/api/v1/identity/devices/add", token.access_token, request_body,
+      "POST", "/api/v1/identity/devices/add", token, request_body,
     );
   }
   _raise_from_device_api_error_code(response_data);
@@ -365,7 +365,7 @@ async function _add_device_via_colocation_binding(
   const api_client = new OneIDAPIClient(credentials.api_base_url);
 
   const session_data = await api_client.make_authenticated_request(
-    "POST", "/api/v1/identity/piv-bind/begin", token.access_token, {
+    "POST", "/api/v1/identity/piv-bind/begin", token, {
       existing_device_fingerprint,
       existing_device_type,
       new_device_type,
@@ -397,7 +397,7 @@ async function _add_device_via_colocation_binding(
   const piv_attestation = await extract_attestation_data(piv_hsm);
 
   const complete_data = await api_client.make_authenticated_request(
-    "POST", "/api/v1/identity/piv-bind/complete", token.access_token, {
+    "POST", "/api/v1/identity/piv-bind/complete", token, {
       session_id,
       c1_quote: c1_quote_data,
       s2_signature_b64,
@@ -484,7 +484,7 @@ export async function requestBurn(
   const api_client = new OneIDAPIClient(credentials.api_base_url);
 
   const burn_token_data = await api_client.make_authenticated_request(
-    "POST", "/api/v1/identity/devices/burn", token.access_token, {
+    "POST", "/api/v1/identity/devices/burn", token, {
       device_fingerprint,
       device_type,
       reason: reason ?? undefined,
@@ -519,7 +519,7 @@ export async function confirmBurn(
   const api_client = new OneIDAPIClient(credentials.api_base_url);
 
   const confirm_data = await api_client.make_authenticated_request(
-    "POST", "/api/v1/identity/devices/burn/confirm", token.access_token, {
+    "POST", "/api/v1/identity/devices/burn/confirm", token, {
       token_id,
       co_device_signature_b64,
       co_device_fingerprint,
@@ -598,7 +598,7 @@ export async function registerOperatorEmail(
   const response_data = await api_client.make_authenticated_request(
     "PUT",
     "/api/v1/identity/operator-email",
-    token.access_token,
+    token,
     { operator_email: operator_email_address },
   );
 

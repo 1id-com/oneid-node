@@ -9,9 +9,10 @@
  *     const identity = await oneid.getOrCreateIdentity({ display_name: "Sparky" });
  *     console.log(`I am ${oneid.format_identity_as_display_string(identity)}`);
  *
- *     // Get an OAuth2 Bearer token for API calls
- *     const token = await oneid.getToken();
- *     // Use token.access_token in Authorization headers
+ *     // Call an API that accepts 1ID tokens: tokens are sender-constrained
+ *     // (cnf.jwk), so each request is signed with the enrolled key (RFC 9421)
+ *     const response = await oneid.fetch_with_airs_proof_of_possession(
+ *       await oneid.getToken(), "https://1id.com/api/v1/identity/devices");
  *
  * The SDK auto-detects your hardware (TPM, YubiKey, Secure Enclave)
  * and enrolls at the highest available trust tier.
@@ -387,6 +388,24 @@ export async function setup_tbs(): Promise<boolean> {
   return (result.ok as boolean) ?? false;
 }
 
+// AIRS sender constraint (registry-04 "HTTP Message Signatures", OWN-038):
+// agents send requests with fetch_with_airs_proof_of_possession(token, url, init);
+// relying parties check them with verify_request.
+import {
+  fetch_with_airs_proof_of_possession,
+  build_sender_constrained_request_headers,
+  sign_request as sign_airs_http_request,
+  verify_request as verify_airs_http_request,
+  AirsHttpMessageSignatureRejected,
+} from "./airsHttpMessageSignatures.js";
+export {
+  fetch_with_airs_proof_of_possession,
+  build_sender_constrained_request_headers,
+  sign_airs_http_request,
+  verify_airs_http_request,
+  AirsHttpMessageSignatureRejected,
+};
+
 // Re-export core functions
 export {
   enroll,
@@ -448,6 +467,10 @@ const oneid = {
   compute_attestation_input_for_direct_mode,
   build_cms_signed_data_for_direct_attestation,
   mailpal,
+  fetch_with_airs_proof_of_possession,
+  build_sender_constrained_request_headers,
+  sign_airs_http_request,
+  verify_airs_http_request,
   VERSION,
   TrustTier,
   KeyAlgorithm,

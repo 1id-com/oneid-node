@@ -1,6 +1,6 @@
 {
   "name": "1id",
-  "version": "3.0.0",
+  "version": "3.1.1",
   "description": "Hardware-anchored identity SDK for AI agents -- 1id.com",
   "keywords": [
     "identity",
@@ -55,7 +55,7 @@
     "build": "tsc",
     "clean": "node -e \"const fs=require('fs'); fs.rmSync('dist',{recursive:true,force:true})\"",
     "prepublishOnly": "npm run clean && npm run build",
-    "test": "node --test dist/test/test_attestation.js",
+    "test": "node --test dist/test/test_attestation.js dist/test/test_declared_binding_proof_and_helper_version.js dist/test/test_airs_http_message_signatures.js",
     "test:src": "npx tsc && node --test dist/test/test_attestation.js"
   },
   "optionalDependencies": {

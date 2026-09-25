@@ -2,8 +2,10 @@
  * OAuth2 token management for the 1id.com Node.js SDK.
  *
  * After enrollment, agents authenticate via hardware challenge-response
- * (TPM for sovereign/virtual, PIV for portable) or OAuth2 client_credentials
- * grant (declared tier only).
+ * (TPM for sovereign/virtual, PIV for portable, Secure Enclave for enclave) or,
+ * for the declared tier, the same challenge signed by the enrolled software key.
+ * Every token is sender-constrained (cnf.jwk): the SDK signs each request with
+ * the enrolled key (RFC 9421, registry-04 "HTTP Message Signatures").
  *
  * SECURITY RULE: Hardware-tier identities NEVER fall back to bare
  * client_credentials. If the hardware device is absent, get_token() throws
@@ -11,7 +13,6 @@
  * credentials.json is useless without the physical device.
  *
  * Token endpoint (F-05 hardened):
- *   POST https://1id.com/api/v1/auth/token  (declared tier only)
  *   POST https://1id.com/api/v1/auth/challenge + /verify  (hardware tiers)
  *   Direct Keycloak token endpoint is blocked by nginx to external clients.
  */
@@ -20,6 +21,12 @@ import { type StoredCredentials, load_credentials } from "./credentials.js";
 import { AuthenticationError, HardwareDeviceNotPresentError, NetworkError } from "./exceptions.js";
 import type { Token } from "./identity.js";
 import { OneIDAPIClient } from "./client.js";
+import * as crypto from "node:crypto";
+import {
+  type AirsRequestSigner,
+  convert_der_ecdsa_signature_to_rfc9421_raw_r_and_s,
+  server_clock_offset_seconds_from_access_token,
+} from "./airsHttpMessageSignatures.js";
 
 const TOKEN_REFRESH_MARGIN_MILLISECONDS = 60_000;
 const TOKEN_REQUEST_TIMEOUT_MILLISECONDS = 15_000;
@@ -39,7 +46,8 @@ let cached_token: Token | null = null;
  * device must be present. If it is absent, HardwareDeviceNotPresentError
  * is thrown -- there is NO fallback to bare client_credentials.
  *
- * For declared tier, the standard OAuth2 client_credentials grant is used.
+ * For declared tier, the challenge is signed with the enrolled software key
+ * (Binding-Proof Authentication); the client_secret is never sent.
  *
  * @param force_refresh If true, always fetch a new token even if cached.
  * @param credentials Optional pre-loaded credentials.
@@ -70,7 +78,7 @@ export async function get_token(
     return token;
   }
 
-  const token = await request_token_from_keycloak(credentials);
+  const token = await authenticate_with_declared_software_key(credentials);
   cached_token = token;
   return token;
 }
@@ -124,42 +132,157 @@ async function authenticate_with_hardware_challenge_response(credentials: Stored
 }
 
 /**
- * Request a new access token from Keycloak using client_credentials grant.
+ * Build the function that signs an RFC 9421 signature base with the enrolled
+ * key that authenticates this identity (registry-04 sender constraint,
+ * OWN-038): "tpm" (the AK via oneid-enroll >= 2.2.0, which hashes inputs over
+ * 1024 bytes with a TPM hash sequence), "piv" (slot 9a), "enclave" (Secure
+ * Enclave) or "declared" (the enrolled software key). Every call reaches the
+ * hardware; nothing is cached. ECDSA signatures are returned as r||s.
  */
-async function request_token_from_keycloak(credentials: StoredCredentials): Promise<Token> {
-  const api_client = new OneIDAPIClient(
-    credentials.api_base_url,
-    TOKEN_REQUEST_TIMEOUT_MILLISECONDS,
-  );
-
-  let token_response: Record<string, unknown>;
-  try {
-    token_response = await api_client.get_token_with_client_credentials(
-      credentials.client_id,
-      credentials.client_secret,
-    );
-  } catch (error) {
-    if (error instanceof NetworkError || error instanceof AuthenticationError) {
-      throw error;
+export function build_airs_request_signer_for_enrolled_key(
+  enrolled_key_kind: "tpm" | "piv" | "enclave" | "declared",
+  options: { ak_handle?: string | null; software_private_key_pem?: string | null } = {},
+): AirsRequestSigner {
+  if (enrolled_key_kind === "tpm") {
+    return async (signature_base: Buffer) => {
+      const { sign_challenge_with_tpm } = await import("./helper.js");
+      const result = await sign_challenge_with_tpm(signature_base.toString("base64"), options.ak_handle ?? "");
+      return Buffer.from(result.signature_b64 as string, "base64");
+    };
+  }
+  if (enrolled_key_kind === "piv") {
+    return async (signature_base: Buffer) => {
+      const { sign_challenge_with_piv } = await import("./helper.js");
+      const result = await sign_challenge_with_piv(signature_base.toString("base64"));
+      return ecdsa_signature_as_raw_r_and_s(Buffer.from(result.signature_b64 as string, "base64"));
+    };
+  }
+  if (enrolled_key_kind === "enclave") {
+    return async (signature_base: Buffer) => {
+      const { sign_challenge_with_enclave } = await import("./helper.js");
+      const result = await sign_challenge_with_enclave(signature_base.toString("base64"));
+      return ecdsa_signature_as_raw_r_and_s(Buffer.from(result.signature_b64 as string, "base64"));
+    };
+  }
+  if (!options.software_private_key_pem) {
+    throw new AuthenticationError("declared identity has no enrolled software key to sign requests with");
+  }
+  const private_key = crypto.createPrivateKey(options.software_private_key_pem);
+  return async (signature_base: Buffer) => {
+    if (private_key.asymmetricKeyType === "ec") {
+      return crypto.sign("sha256", signature_base, { key: private_key, dsaEncoding: "ieee-p1363" });
     }
+    if (private_key.asymmetricKeyType === "rsa") {
+      return crypto.sign("sha256", signature_base, private_key);
+    }
+    if (private_key.asymmetricKeyType === "ed25519") {
+      return crypto.sign(null, signature_base, private_key);
+    }
+    throw new AuthenticationError(`Unsupported enrolled key type: ${private_key.asymmetricKeyType}`);
+  };
+}
+
+function ecdsa_signature_as_raw_r_and_s(signature: Buffer): Buffer {
+  // strict DER first (PIV + Secure Enclave return DER); a 64-octet value that
+  // is not exact DER is already r||s
+  try {
+    return convert_der_ecdsa_signature_to_rfc9421_raw_r_and_s(signature);
+  } catch (der_error) {
+    if (signature.length === 64) { return signature; }
+    throw new AuthenticationError(`ECDSA P-256 signature is neither DER nor 64-octet r||s: ${der_error}`);
+  }
+}
+
+/** The token's cnf.jwk, read without verification (used only as the RFC 9421 keyid). */
+export function confirmation_jwk_from_access_token(access_token: string): Record<string, string> | null {
+  try {
+    const payload = JSON.parse(Buffer.from(access_token.split(".")[1], "base64url").toString("utf8"));
+    const jwk = payload?.cnf?.jwk;
+    return jwk && typeof jwk === "object" ? jwk as Record<string, string> : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Declared-tier Binding-Proof Authentication: sign the server's nonce with the
+ * software key enrolled for this identity (the Registrar checks it against the
+ * key's RFC 7638 thumbprint recorded at enrollment). No static client_secret is
+ * sent (registry draft, "Client Credentials Grant"; external review 072 #6).
+ */
+export async function authenticate_with_declared_software_key(
+  credentials?: StoredCredentials | null,
+): Promise<Token> {
+  if (credentials == null) {
+    credentials = load_credentials();
+  }
+  if (!credentials.private_key_pem) {
     throw new AuthenticationError(
-      `Token request failed: ${error instanceof Error ? error.message : String(error)}`
+      "This declared identity has no enrolled signing key in its credentials file, " +
+      "so it cannot perform binding-proof authentication."
     );
   }
+  const api_client = new OneIDAPIClient(credentials.api_base_url, TOKEN_REQUEST_TIMEOUT_MILLISECONDS);
 
-  const access_token = token_response.access_token as string;
-  if (!access_token) {
-    throw new AuthenticationError("Token response missing 'access_token' field");
+  let challenge_data: Record<string, unknown>;
+  try {
+    challenge_data = await api_client["_make_request"]("POST", "/api/v1/auth/challenge", {
+      identity_id: credentials.client_id,
+      device_type: "declared",
+    });
+  } catch (error) {
+    if (error instanceof NetworkError) { throw error; }
+    throw new AuthenticationError(
+      `Challenge request failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  const challenge_id = challenge_data.challenge_id as string;
+  const nonce_b64 = challenge_data.nonce_b64 as string;
+  if (!challenge_id || !nonce_b64) {
+    throw new AuthenticationError("Server returned incomplete challenge response");
   }
 
-  const expires_in_seconds = (token_response.expires_in as number) ?? 3600;
-  const expires_at = new Date(Date.now() + expires_in_seconds * 1000);
+  const private_key = crypto.createPrivateKey(credentials.private_key_pem);
+  const nonce = Buffer.from(nonce_b64, "base64");
+  let signature: Buffer;
+  if (private_key.asymmetricKeyType === "ec") {
+    signature = crypto.sign("sha256", nonce, { key: private_key, dsaEncoding: "der" });
+  } else if (private_key.asymmetricKeyType === "rsa") {
+    signature = crypto.sign("sha256", nonce, private_key);
+  } else if (private_key.asymmetricKeyType === "ed25519") {
+    signature = crypto.sign(null, nonce, private_key);
+  } else {
+    throw new AuthenticationError(`Unsupported enrolled key type: ${private_key.asymmetricKeyType}`);
+  }
+  const public_key_pem = crypto.createPublicKey(private_key).export({ type: "spki", format: "pem" }).toString();
 
+  let verify_data: Record<string, unknown>;
+  try {
+    verify_data = await api_client["_make_request"]("POST", "/api/v1/auth/verify", {
+      challenge_id,
+      signature_b64: signature.toString("base64"),
+      public_key_pem,
+    });
+  } catch (error) {
+    if (error instanceof NetworkError) { throw error; }
+    throw new AuthenticationError(
+      `Declared-tier binding-proof authentication failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  const tokens = verify_data.authenticated ? verify_data.tokens as Record<string, unknown> | undefined : undefined;
+  if (!tokens?.access_token) {
+    throw new AuthenticationError("Binding proof verified but no tokens were issued");
+  }
+  const expires_in_seconds = (tokens.expires_in as number) ?? 3600;
   return {
-    access_token,
-    token_type: (token_response.token_type as string) ?? "Bearer",
-    expires_at,
-    refresh_token: (token_response.refresh_token as string) ?? null,
+    access_token: tokens.access_token as string,
+    token_type: (tokens.token_type as string) ?? "Bearer",
+    expires_at: new Date(Date.now() + expires_in_seconds * 1000),
+    refresh_token: (tokens.refresh_token as string) ?? null,
+    airs_request_signer: build_airs_request_signer_for_enrolled_key(
+      "declared", { software_private_key_pem: credentials.private_key_pem }),
+    confirmation_jwk: confirmation_jwk_from_access_token(tokens.access_token as string),
+    server_clock_offset_seconds: server_clock_offset_seconds_from_access_token(tokens.access_token as string),
   };
 }
 
@@ -220,6 +343,11 @@ export async function authenticate_with_tpm(
     api_base_url = credentials.api_base_url;
   }
 
+  // OWN-039: fetch/verify the helper BEFORE asking for a challenge -- a first
+  // download on a slow link (minutes) must not outlive the challenge.
+  const { ensure_binary_available } = await import("./helper.js");
+  await ensure_binary_available();
+
   const api_client = new OneIDAPIClient(api_base_url, TOKEN_REQUEST_TIMEOUT_MILLISECONDS);
 
   let challenge_data: Record<string, unknown>;
@@ -278,6 +406,9 @@ export async function authenticate_with_tpm(
       token_type: (tokens.token_type as string) ?? "Bearer",
       expires_at: new Date(Date.now() + expires_in_seconds * 1000),
       refresh_token: (tokens.refresh_token as string) ?? null,
+      airs_request_signer: build_airs_request_signer_for_enrolled_key("tpm", { ak_handle }),
+      confirmation_jwk: confirmation_jwk_from_access_token(tokens.access_token as string),
+      server_clock_offset_seconds: server_clock_offset_seconds_from_access_token(tokens.access_token as string),
     };
     cached_token = token;
     return token;
@@ -312,6 +443,11 @@ export async function authenticate_with_piv(
   if (api_base_url == null) {
     api_base_url = credentials.api_base_url;
   }
+
+  // OWN-039: fetch/verify the helper BEFORE asking for a challenge -- a first
+  // download on a slow link (minutes) must not outlive the challenge.
+  const { ensure_binary_available } = await import("./helper.js");
+  await ensure_binary_available();
 
   const api_client = new OneIDAPIClient(api_base_url, TOKEN_REQUEST_TIMEOUT_MILLISECONDS);
 
@@ -368,6 +504,9 @@ export async function authenticate_with_piv(
       token_type: (tokens.token_type as string) ?? "Bearer",
       expires_at: new Date(Date.now() + expires_in_seconds * 1000),
       refresh_token: (tokens.refresh_token as string) ?? null,
+      airs_request_signer: build_airs_request_signer_for_enrolled_key("piv"),
+      confirmation_jwk: confirmation_jwk_from_access_token(tokens.access_token as string),
+      server_clock_offset_seconds: server_clock_offset_seconds_from_access_token(tokens.access_token as string),
     };
     cached_token = token;
     return token;
@@ -467,6 +606,9 @@ export async function authenticate_with_enclave(
       token_type: (tokens.token_type as string) ?? "Bearer",
       expires_at: new Date(Date.now() + expires_in_seconds * 1000),
       refresh_token: (tokens.refresh_token as string) ?? null,
+      airs_request_signer: build_airs_request_signer_for_enrolled_key("enclave"),
+      confirmation_jwk: confirmation_jwk_from_access_token(tokens.access_token as string),
+      server_clock_offset_seconds: server_clock_offset_seconds_from_access_token(tokens.access_token as string),
     };
     cached_token = token;
     return token;

@@ -111,7 +111,7 @@ export async function fetch_world_status_from_server(
   const world_data = await api_client.make_authenticated_request(
     "GET",
     "/api/v1/identity/world",
-    token.access_token,
+    token,
   );
 
   const parsed_world_status = parse_world_response_to_world_status(world_data);

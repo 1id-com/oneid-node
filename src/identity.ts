@@ -103,6 +103,18 @@ export interface Token {
   readonly expires_at: Date;
   /** Refresh token for obtaining new access tokens, or null. */
   readonly refresh_token: string | null;
+  /**
+   * Sender constraint (registry-04 "HTTP Message Signatures", OWN-038): signs
+   * an RFC 9421 signature base with the enrolled key that authenticated for
+   * this token (TPM AK, PIV slot key, Secure Enclave key or declared key).
+   * The SDK signs every authenticated request with it; the access token alone
+   * is useless to a thief. Set by getToken().
+   */
+  readonly airs_request_signer?: (signature_base: Buffer) => Promise<Buffer>;
+  /** The token's cnf.jwk (the confirmation key's public JWK), used as the RFC 9421 keyid. */
+  readonly confirmation_jwk?: Record<string, string> | null;
+  /** Issuer clock minus local clock (from iat at arrival): signed requests use the issuer's clock. */
+  readonly server_clock_offset_seconds?: number;
 }
 
 /**

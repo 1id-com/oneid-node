@@ -27,6 +27,8 @@
 
 import { createHash, constants as crypto_constants, verify as crypto_verify, X509Certificate } from "crypto";
 import { get_token } from "./auth.js";
+import type { Token } from "./identity.js";
+import { fetch_with_airs_proof_of_possession } from "./airsHttpMessageSignatures.js";
 import { load_credentials } from "./credentials.js";
 import { AuthenticationError, NetworkError, NotEnrolledError } from "./exceptions.js";
 
@@ -695,11 +697,8 @@ export async function prepareAttestation(
   const creds = load_credentials();
   const effective_api_base_url = apiBaseUrl ?? creds.api_base_url ?? "https://1id.com";
 
+  // sent sender-constrained: each call is signed with the enrolled key (OWN-038)
   const token = await get_token();
-  const auth_headers: Record<string, string> = {
-    "Authorization": `Bearer ${token.access_token}`,
-    "Content-Type": "application/json",
-  };
 
   const proof: AttestationProof = {
     sd_jwt: null,
@@ -741,7 +740,7 @@ export async function prepareAttestation(
 
     const sd_jwt_result = await _fetch_sd_jwt_proof_for_message(
       effective_api_base_url,
-      auth_headers,
+      token,
       nonce_value,
       proposed_iat,
       disclosedClaims,
@@ -753,7 +752,7 @@ export async function prepareAttestation(
   }
 
   if (includeContactToken) {
-    const contact_result = await _fetch_contact_token(effective_api_base_url, auth_headers);
+    const contact_result = await _fetch_contact_token(effective_api_base_url, token);
     proof.contact_token = contact_result.token;
     proof.contact_address = contact_result.contact_address;
   }
@@ -763,7 +762,7 @@ export async function prepareAttestation(
 
 async function _fetch_sd_jwt_proof_for_message(
   api_base_url: string,
-  auth_headers: Record<string, string>,
+  token: Token,
   precomputed_nonce: string,
   proposed_iat: number,
   disclosed_claims: string[],
@@ -780,9 +779,9 @@ async function _fetch_sd_jwt_proof_for_message(
   if (cnf_jwk) { request_body.cnf_jwk = cnf_jwk; }  // Combined mode (AUD-F47)
   if (session_device_type) { request_body.device_type = session_device_type; }
 
-  const response = await fetch(url, {
+  const response = await fetch_with_airs_proof_of_possession(token, url, {
     method: "POST",
-    headers: auth_headers,
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request_body),
     signal: AbortSignal.timeout(_HTTP_TIMEOUT_MILLISECONDS),
   });
@@ -807,15 +806,15 @@ async function _fetch_sd_jwt_proof_for_message(
 
 async function _fetch_binding_jws(
   api_base_url: string,
-  auth_headers: Record<string, string>,
+  token: Token,
   proof_public_key_jwk: Record<string, unknown>,
 ): Promise<string | null> {
   const url = `${api_base_url}/api/v1/proof/binding`;
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch_with_airs_proof_of_possession(token, url, {
       method: "POST",
-      headers: { ...auth_headers, "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ proof_public_key_jwk }),
       signal: AbortSignal.timeout(_HTTP_TIMEOUT_MILLISECONDS),
     });
@@ -835,14 +834,13 @@ async function _fetch_binding_jws(
 
 async function _fetch_contact_token(
   api_base_url: string,
-  auth_headers: Record<string, string>,
+  token: Token,
 ): Promise<{ token: string | null; contact_address: string | null }> {
   const url = `${api_base_url}/api/v1/contact-token`;
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch_with_airs_proof_of_possession(token, url, {
       method: "GET",
-      headers: auth_headers,
       signal: AbortSignal.timeout(_HTTP_TIMEOUT_MILLISECONDS),
     });
 

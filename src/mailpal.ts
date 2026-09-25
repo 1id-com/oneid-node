@@ -38,6 +38,8 @@ import * as dns from "node:dns";
 import * as https from "node:https";
 import * as http from "node:http";
 import { get_token } from "./auth.js";
+import type { Token } from "./identity.js";
+import { build_sender_constrained_request_headers } from "./airsHttpMessageSignatures.js";
 import { type StoredCredentials, load_credentials, save_credentials } from "./credentials.js";
 import {
   prepareAttestation,
@@ -163,30 +165,41 @@ interface MailpalHttpResponse {
   raw: string;
 }
 
-function _make_mailpal_http_request(
+/**
+ * auth: extra headers, or a Token -- a Token is sent sender-constrained
+ * (Authorization + an RFC 9421 signature by the enrolled key over exactly this
+ * method, URL and body; registry-04 "HTTP Message Signatures", OWN-038).
+ */
+async function _make_mailpal_http_request(
   method: string,
   url_string: string,
   body_json: Record<string, unknown> | null,
-  auth_headers: Record<string, string>,
+  auth: Record<string, string> | Token,
   timeout_milliseconds: number = _HTTP_TIMEOUT_MILLISECONDS,
 ): Promise<MailpalHttpResponse> {
+  const url = new URL(url_string);
+  let request_headers: Record<string, string> = {
+    "User-Agent": _USER_AGENT,
+    "Accept": "application/json",
+  };
+  let request_body_string: string | undefined;
+  if (body_json != null) {
+    request_body_string = JSON.stringify(body_json);
+    request_headers["Content-Type"] = "application/json";
+  }
+  if ("access_token" in auth) {
+    request_headers = await build_sender_constrained_request_headers(
+      auth as Token, method, url.href,
+      request_body_string != null ? Buffer.from(request_body_string, "utf8") : null, request_headers);
+  } else {
+    request_headers = { ...request_headers, ...(auth as Record<string, string>) };
+  }
+  if (request_body_string != null) {
+    request_headers["Content-Length"] = Buffer.byteLength(request_body_string).toString();
+  }
   return new Promise((resolve, reject) => {
-    const url = new URL(url_string);
     const is_https = url.protocol === "https:";
     const transport = is_https ? https : http;
-
-    const request_headers: Record<string, string> = {
-      "User-Agent": _USER_AGENT,
-      "Accept": "application/json",
-      ...auth_headers,
-    };
-
-    let request_body_string: string | undefined;
-    if (body_json != null) {
-      request_body_string = JSON.stringify(body_json);
-      request_headers["Content-Type"] = "application/json";
-      request_headers["Content-Length"] = Buffer.byteLength(request_body_string).toString();
-    }
 
     const req = transport.request({
       hostname: url.hostname,
@@ -225,9 +238,9 @@ function _make_mailpal_http_request(
 }
 
 
-async function _get_bearer_auth_headers(): Promise<Record<string, string>> {
-  const token = await get_token();
-  return { "Authorization": `Bearer ${token.access_token}` };
+/** The current Token: _make_mailpal_http_request sends it sender-constrained. */
+async function _get_bearer_auth_headers(): Promise<Token> {
+  return await get_token();
 }
 
 
@@ -1301,14 +1314,10 @@ export async function get_contact_token(
   const creds = load_credentials();
   const api_base_url = oneid_api_url ?? creds.api_base_url ?? "https://1id.com";
 
-  const token = await get_token();
-  const auth_headers: Record<string, string> = {
-    "Authorization": `Bearer ${token.access_token}`,
-    "User-Agent": _USER_AGENT,
-  };
+  const token = await get_token();  // sent sender-constrained (OWN-038)
 
   const url = `${api_base_url}/api/v1/contact-token`;
-  const response = await _make_mailpal_http_request("GET", url, null, auth_headers);
+  const response = await _make_mailpal_http_request("GET", url, null, token);
 
   if (response.status_code !== 200) { return null; }
 

@@ -84,7 +84,7 @@ async function make_authenticated_credential_pointer_request(
   }
   const token = await get_token(false, credentials);
   const api_client = new OneIDAPIClient(credentials.api_base_url);
-  return api_client.make_authenticated_request(method, api_path, token.access_token, json_body);
+  return api_client.make_authenticated_request(method, api_path, token, json_body);
 }
 
 /**

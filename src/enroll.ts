@@ -166,7 +166,7 @@ export async function enroll(options?: EnrollOptions): Promise<Identity> {
       `(trust tier: ${existing_credentials.trust_tier}). ` +
       `Your identity is ready to use right now:\n` +
       `  const id = oneid.whoami()            // local, no network\n` +
-      `  const token = await oneid.getToken()  // OAuth2 Bearer token\n` +
+      `  const token = await oneid.getToken()  // sender-constrained: send with fetch_with_airs_proof_of_possession\n` +
       `  const world = await oneid.status()    // full picture from server\n` +
       `Creating a second identity on the same machine is not supported.`
     );
