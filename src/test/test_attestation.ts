@@ -492,7 +492,7 @@ describe("prepare_direct_hardware_attestation signer and binding rules", () => {
     await assert.rejects(
       run_with_temporary_declared_credentials(mismatched_credentials,
         () => prepare_direct_hardware_attestation({ ..._SAMPLE_EMAIL_HEADERS }, Buffer.from("body\r\n"))),
-      /does not match/,
+      /No stored certificate chain matches/,
     );
   });
 });

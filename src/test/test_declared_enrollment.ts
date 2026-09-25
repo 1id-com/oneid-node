@@ -12,6 +12,8 @@ import { describe, it, before, after } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as crypto from "node:crypto";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import {
   enroll,
@@ -39,6 +41,20 @@ import { generate_keypair } from "../keys.js";
 
 // -- Test configuration --
 const BACKUP_SUFFIX = ".test-backup";
+
+// Never touch the machine's real identity: every credential read/write in this
+// file goes to a fresh temporary config directory (APPDATA on Windows,
+// XDG_CONFIG_HOME elsewhere; both are read at call time).
+const isolated_config_directory = fs.mkdtempSync(path.join(os.tmpdir(), "oneid-node-test-config-"));
+process.env["APPDATA"] = isolated_config_directory;
+process.env["XDG_CONFIG_HOME"] = isolated_config_directory;
+
+// Live tests enroll REAL identities at https://1id.com; like the Python suite
+// they run only when ONEID_RUN_LIVE_TESTS=1 (make test-node stays offline).
+const live_tests_enabled = process.env["ONEID_RUN_LIVE_TESTS"] === "1";
+
+const package_json_version = (JSON.parse(fs.readFileSync(
+  new URL("../../package.json", import.meta.url), "utf-8")) as { version: string }).version;
 
 // =====================================================================
 // OFFLINE UNIT TESTS (no network required)
@@ -211,7 +227,7 @@ describe("Exception hierarchy (offline)", () => {
 
 describe("SDK version and types (offline)", () => {
   it("should report correct SDK version", () => {
-    assert.equal(VERSION, "0.5.0");
+    assert.equal(VERSION, package_json_version);
   });
 
   it("should have all trust tiers", () => {
@@ -256,7 +272,7 @@ describe("Input validation (offline)", () => {
 // LIVE ENROLLMENT TEST (requires network + working server)
 // =====================================================================
 
-describe("Live declared-tier enrollment (requires server)", () => {
+describe("Live declared-tier enrollment (requires server)", { skip: !live_tests_enabled }, () => {
   let backed_up_credentials_exist = false;
   const credentials_file_path = get_credentials_file_path();
   const backup_path = credentials_file_path + BACKUP_SUFFIX;

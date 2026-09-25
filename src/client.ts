@@ -171,11 +171,17 @@ export class OneIDAPIClient {
     operator_email?: string | null,
     requested_handle?: string | null,
     display_name?: string | null,
+    proof_of_possession_signature_b64?: string | null,
+    proof_of_possession_signed_at_unix?: number | null,
   ): Promise<Record<string, unknown>> {
     const request_body: Record<string, unknown> = {
       software_key_pem,
       key_algorithm,
     };
+    if (proof_of_possession_signature_b64 != null) {
+      request_body["proof_of_possession_signature_b64"] = proof_of_possession_signature_b64;
+      request_body["proof_of_possession_signed_at_unix"] = proof_of_possession_signed_at_unix;
+    }
     if (operator_email != null) { request_body["operator_email"] = operator_email; }
     if (requested_handle != null) { request_body["requested_handle"] = requested_handle; }
     if (display_name != null) { request_body["display_name"] = display_name; }
@@ -195,6 +201,7 @@ export class OneIDAPIClient {
     hsm_type: string = "tpm",
     operator_email?: string | null,
     requested_handle?: string | null,
+    display_name?: string | null,
   ): Promise<Record<string, unknown>> {
     const request_body: Record<string, unknown> = {
       ek_certificate_pem,
@@ -206,6 +213,8 @@ export class OneIDAPIClient {
     if (ek_certificate_chain_pem) { request_body["ek_certificate_chain_pem"] = ek_certificate_chain_pem; }
     if (operator_email != null) { request_body["operator_email"] = operator_email; }
     if (requested_handle != null) { request_body["requested_handle"] = requested_handle; }
+    // OWN-029: the friendly name was dropped for TPM enrollment (Python sent it).
+    if (display_name != null) { request_body["display_name"] = display_name; }
 
     return this._make_request("POST", "/api/v1/enroll/begin", request_body);
   }
@@ -225,6 +234,7 @@ export class OneIDAPIClient {
     hsm_type: string = "yubikey",
     operator_email?: string | null,
     requested_handle?: string | null,
+    display_name?: string | null,
   ): Promise<Record<string, unknown>> {
     const request_body: Record<string, unknown> = {
       attestation_cert_pem,
@@ -234,6 +244,8 @@ export class OneIDAPIClient {
     };
     if (operator_email != null) { request_body["operator_email"] = operator_email; }
     if (requested_handle != null) { request_body["requested_handle"] = requested_handle; }
+    // OWN-029: the friendly name was dropped for PIV enrollment (Python sent it).
+    if (display_name != null) { request_body["display_name"] = display_name; }
 
     return this._make_request("POST", "/api/v1/enroll/begin/piv", request_body);
   }

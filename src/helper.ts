@@ -21,6 +21,7 @@ import * as https from "node:https";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createRequire } from "node:module";
 
 import {
   BinaryNotFoundError,
@@ -206,18 +207,64 @@ function download_text_from_url(url: string, max_redirects: number = 5): Promise
   });
 }
 
+/** Publisher identity of the release binaries (AUD-F07). Windows: the Authenticode
+ * signer certificate's organisation; macOS: the Apple Developer ID team. */
+export const EXPECTED_WINDOWS_AUTHENTICODE_SIGNER_ORGANIZATION = "O=Aura Friday";
+export const EXPECTED_APPLE_DEVELOPER_ID_TEAM_IDENTIFIER = "XQYBH3CT45";
+
 /**
- * Download the oneid-enroll binary from the GitHub 'latest' release.
- *
- * Downloads to a temporary file first, verifies the SHA-256 checksum,
- * then moves to the final location.
+ * Require a valid publisher code signature on a downloaded helper (Windows:
+ * Authenticode by EXPECTED_WINDOWS_AUTHENTICODE_SIGNER_ORGANIZATION; macOS:
+ * Developer ID of EXPECTED_APPLE_DEVELOPER_ID_TEAM_IDENTIFIER). Linux binaries are
+ * not code-signed; their SHA-256 check is the only one. Needs no elevation.
+ * @throws BinaryNotFoundError when the signature is missing, invalid, or not ours.
  */
-async function download_binary_from_github_release(
+export function verify_publisher_code_signature_of_downloaded_release_asset(asset_path: string, asset_name: string): void {
+  if (os.platform() === "win32") {
+    const powershell_script =
+      "$s = Get-AuthenticodeSignature -LiteralPath $env:ONEID_HELPER_TO_VERIFY; " +
+      "$s.Status.ToString() + '|' + $(if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { '' })";
+    let output: string;
+    try {
+      output = child_process.execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", powershell_script], {
+        encoding: "utf8", timeout: 60000, env: { ...process.env, ONEID_HELPER_TO_VERIFY: asset_path },
+      });
+    } catch (powershell_error) {
+      throw new BinaryNotFoundError(`Could not check the Authenticode signature of ${asset_name}: ${powershell_error}`);
+    }
+    const [status_text, ...subject_parts] = output.trim().split("|");
+    const signer_subject = subject_parts.join("|");
+    if (status_text !== "Valid" || !signer_subject.includes(EXPECTED_WINDOWS_AUTHENTICODE_SIGNER_ORGANIZATION)) {
+      throw new BinaryNotFoundError(
+        `${asset_name} is not validly signed by ${EXPECTED_WINDOWS_AUTHENTICODE_SIGNER_ORGANIZATION} ` +
+        `(Authenticode status ${status_text || "unknown"}, signer '${signer_subject}'); refusing to install it.`
+      );
+    }
+  } else if (os.platform() === "darwin") {
+    const verify_run = child_process.spawnSync("codesign", ["--verify", "--strict", asset_path], { encoding: "utf8", timeout: 60000 });
+    const describe_run = child_process.spawnSync("codesign", ["-dv", "--verbose=2", asset_path], { encoding: "utf8", timeout: 60000 });
+    const team_line = `TeamIdentifier=${EXPECTED_APPLE_DEVELOPER_ID_TEAM_IDENTIFIER}`;
+    if (verify_run.status !== 0 || !`${describe_run.stdout ?? ""}${describe_run.stderr ?? ""}`.includes(team_line)) {
+      throw new BinaryNotFoundError(
+        `${asset_name} is not validly signed by Apple Developer ID team ${EXPECTED_APPLE_DEVELOPER_ID_TEAM_IDENTIFIER}; ` +
+        `refusing to install it. ${(verify_run.stderr ?? "").trim().slice(0, 200)}`
+      );
+    }
+  }
+}
+
+/**
+ * Download a release asset (oneid-enroll or oneid-se-helper) from the GitHub
+ * 'latest' release: temporary file, SHA-256 check (fail closed), publisher code
+ * signature check, then move to the final location.
+ */
+export async function download_binary_from_github_release(
   binary_name: string,
   destination_path: string,
+  release_download_url_template: string = GITHUB_RELEASE_DOWNLOAD_URL_TEMPLATE,
 ): Promise<string> {
-  const binary_download_url = GITHUB_RELEASE_DOWNLOAD_URL_TEMPLATE.replace("{binary_name}", binary_name);
-  const checksum_download_url = GITHUB_RELEASE_DOWNLOAD_URL_TEMPLATE.replace("{binary_name}", binary_name + ".sha256");
+  const binary_download_url = release_download_url_template.replace("{binary_name}", binary_name);
+  const checksum_download_url = release_download_url_template.replace("{binary_name}", binary_name + ".sha256");
 
   const destination_dir = path.dirname(destination_path);
   fs.mkdirSync(destination_dir, { recursive: true });
@@ -254,12 +301,16 @@ async function download_binary_from_github_release(
       }
     } catch (checksum_error) {
       if (checksum_error instanceof BinaryNotFoundError) { throw checksum_error; }
-      // Checksum download failed -- proceed without verification (warn)
-      console.warn(
-        `[oneid] Could not download checksum file (${checksum_error}). ` +
-        "Proceeding without verification."
+      // AUD-F07: never install a helper whose integrity could not be checked.
+      throw new BinaryNotFoundError(
+        `Could not download the checksum for ${binary_name} (${checksum_error}); ` +
+        "refusing to install an unverified helper."
       );
     }
+
+    // Step 2b: the checksum comes from the same release as the binary, so also
+    // require the publisher's code signature where the platform has one.
+    verify_publisher_code_signature_of_downloaded_release_asset(temp_file_path, binary_name);
 
     // Step 3: Move temp file to final destination
     if (fs.existsSync(destination_path)) {
@@ -476,11 +527,13 @@ export interface SigningCapabilityTierDetectionResult {
  *   Handles all HSM types (TPM, PIV, Enclave). Requires the compiled binary.
  *   Supports --serial/--reader for multi-YubiKey targeting (v1.3.0+).
  *
- * Tier B -- Native Node.js extensions (pcsclite for PIV):
- *   Direct PC/SC access without spawning a subprocess. Requires the
- *   'pcsclite' or '@nickcis/smartcard' npm package (native C++ addon).
- *   Currently PIV-only. Not yet implemented -- detection is a placeholder
- *   that checks whether the pcsclite module can be loaded.
+ * Tier B -- Native Node.js PC/SC for PIV (optional 'smartcard' npm package):
+ *   Direct PC/SC access without spawning a subprocess: multi-YubiKey
+ *   enumeration, serial selection and PIV GENERAL AUTHENTICATE signing
+ *   (enumerate_all_piv_capable_yubikeys_via_smartcard /
+ *   sign_nonce_with_specific_piv_reader_via_smartcard). PIV only; TPM and
+ *   Secure Enclave always use Tier A (the helper). Same as the Python SDK
+ *   (pyscard).
  *
  * Tier C -- Software-only:
  *   No hardware signing. Always available as baseline.
@@ -605,8 +658,8 @@ export async function setup_tbs_for_non_admin_tpm_access(): Promise<Record<strin
  *
  *   Tier A (Go binary): Spawns oneid-enroll with --serial/--reader targeting.
  *     Supports all platforms. v1.3.0+ supports multi-YubiKey by serial.
- *   Tier B (pcsclite): Direct PC/SC signing from Node.js without subprocess.
- *     Requires the pcsclite npm package (native C++ addon). NOT YET IMPLEMENTED.
+ *   Tier B (optional 'smartcard' npm package): direct PC/SC signing from
+ *     Node.js without a subprocess (multi-YubiKey by serial).
  *   Tier C: Not applicable for PIV (hardware key is required).
  *
  * Currently uses Tier A exclusively. When pcsclite support is added, this
@@ -735,7 +788,30 @@ function find_secure_enclave_helper_binary(): string | null {
   const home_oneid_path = path.join(os.homedir(), ".oneid", "bin", se_helper_name);
   if (file_exists_and_is_executable(home_oneid_path)) { return home_oneid_path; }
 
+  for (const path_directory of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!path_directory) { continue; }
+    const path_candidate = path.join(path_directory, se_helper_name);
+    if (file_exists_and_is_executable(path_candidate)) { return path_candidate; }
+  }
+
   return null;
+}
+
+/**
+ * Find oneid-se-helper, or download it from the oneid-enroll GitHub release into
+ * the helper cache (OWN-030: previously it had to be placed by hand). The download
+ * is SHA-256- and Developer-ID-verified like oneid-enroll. macOS only.
+ * @throws NoHSMError when not on macOS; BinaryNotFoundError when the download fails.
+ */
+export async function ensure_secure_enclave_helper_available(): Promise<string> {
+  if (os.platform() !== "darwin") {
+    throw new NoHSMError("The Secure Enclave helper exists only on macOS");
+  }
+  const existing_helper = find_secure_enclave_helper_binary();
+  if (existing_helper != null) { return existing_helper; }
+  const release_asset_name = os.arch() === "arm64" ? "oneid-se-helper-arm64" : "oneid-se-helper";
+  const destination = path.join(get_binary_cache_directory(), "oneid-se-helper");
+  return await download_binary_from_github_release(release_asset_name, destination);
 }
 
 /**
@@ -754,12 +830,12 @@ function find_secure_enclave_helper_binary(): string | null {
 export async function sign_challenge_with_enclave(
   nonce_b64: string,
 ): Promise<Record<string, unknown>> {
-  const se_helper_path = find_secure_enclave_helper_binary();
-  if (se_helper_path == null) {
-    throw new NoHSMError(
-      "oneid-se-helper binary not found. "
-      + "It should be in ~/.oneid/bin/ alongside oneid-enroll."
-    );
+  let se_helper_path: string;
+  try {
+    se_helper_path = await ensure_secure_enclave_helper_available();
+  } catch (se_helper_download_error) {
+    if (se_helper_download_error instanceof NoHSMError) { throw se_helper_download_error; }
+    throw new NoHSMError(`oneid-se-helper binary not found and could not be downloaded: ${se_helper_download_error}`);
   }
 
   const cmd_args = ["sign", "--tag", ENCLAVE_DEFAULT_KEY_TAG, "--nonce", nonce_b64];
@@ -818,9 +894,13 @@ export interface EnumeratedYubiKeyInfo {
  * Try to load the optional 'smartcard' npm package.
  * Returns null if not installed.
  */
+const require_optional_commonjs_module = createRequire(import.meta.url);
+
 function _try_load_smartcard_module(): any | null {
   try {
-    return require("smartcard");
+    // AUD-F43: this package is ESM, where a bare require() does not exist;
+    // createRequire loads the optional CommonJS 'smartcard' addon.
+    return require_optional_commonjs_module("smartcard");
   } catch {
     return null;
   }

@@ -16,6 +16,7 @@
  *   - Credentials are NEVER logged or printed
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -67,6 +68,10 @@ export interface StoredCredentials {
   mailpal_email?: string | null;
   /** MailPal SMTP app-password assigned during mailpal.activate(). */
   mailpal_app_password?: string | null;
+  /** Per-device certificate chains keyed by device fingerprint: each value is
+   *  {device_type, certificate_chain_pem} (or a bare PEM string from older
+   *  servers). Filled by sync_device_certificate_chains_from_server(). */
+  device_certificate_chains?: Record<string, unknown> | null;
 }
 
 /**
@@ -154,6 +159,9 @@ export function save_credentials(credentials: StoredCredentials): string {
   if (credentials.identity_certificate_chain_pem != null) {
     credentials_dict["identity_certificate_chain_pem"] = credentials.identity_certificate_chain_pem;
   }
+  if (credentials.device_certificate_chains != null) {
+    credentials_dict["device_certificate_chains"] = credentials.device_certificate_chains;
+  }
   if (credentials.enclave_key_data_representation_b64 != null) {
     credentials_dict["enclave_key_data_representation_b64"] = credentials.enclave_key_data_representation_b64;
   }
@@ -164,7 +172,18 @@ export function save_credentials(credentials: StoredCredentials): string {
     credentials_dict["mailpal_app_password"] = credentials.mailpal_app_password;
   }
 
-  fs.writeFileSync(credentials_file_path, JSON.stringify(credentials_dict, null, 2) + "\n", "utf-8");
+  // AUD-F71: the secrets never sit in a world-readable file -- write a temporary
+  // file that is CREATED owner-only (0600), then atomically replace the real one
+  // (also no half-written credentials if the process dies mid-write). Same as Python.
+  const temporary_file_path = `${credentials_file_path}.tmp-${crypto.randomBytes(4).toString("hex")}`;
+  try {
+    fs.writeFileSync(temporary_file_path, JSON.stringify(credentials_dict, null, 2) + "\n",
+      { encoding: "utf-8", mode: 0o600, flag: "wx" });
+    fs.renameSync(temporary_file_path, credentials_file_path);
+  } catch (write_error) {
+    try { fs.unlinkSync(temporary_file_path); } catch { /* already gone */ }
+    throw write_error;
+  }
   set_owner_only_permissions(credentials_file_path);
 
   return credentials_file_path;
@@ -241,7 +260,56 @@ export function load_credentials(): StoredCredentials {
     enclave_key_data_representation_b64: (credentials_dict["enclave_key_data_representation_b64"] as string) ?? null,
     mailpal_email: (credentials_dict["mailpal_email"] as string) ?? null,
     mailpal_app_password: (credentials_dict["mailpal_app_password"] as string) ?? null,
+    device_certificate_chains: (credentials_dict["device_certificate_chains"] as Record<string, unknown>) ?? null,
   };
+}
+
+/**
+ * Which local device signs for these credentials: "piv", "enclave", "tpm",
+ * "software", or null. The ENROLLED LOCAL BINDING decides (hsm_key_reference:
+ * "piv-*" = YubiKey, "secure-enclave" = Secure Enclave, any other reference = TPM
+ * AK); the trust tier is only the fallback when no reference is stored. An
+ * identity's tier and its local device differ after recovery or device
+ * addition (AUD-F66, AUD-LOST1). Same rule as the Python SDK.
+ */
+export function local_signing_device_type_for_credentials(
+  credentials: StoredCredentials,
+): "piv" | "enclave" | "tpm" | "software" | null {
+  const key_reference = (credentials.hsm_key_reference ?? "").trim();
+  if (key_reference.startsWith("piv-")) { return "piv"; }
+  if (key_reference === "secure-enclave") { return "enclave"; }
+  if (key_reference) { return "tpm"; }
+  const trust_tier = credentials.trust_tier ?? "declared";
+  if (trust_tier === "portable") { return "piv"; }
+  if (trust_tier === "enclave") { return "enclave"; }
+  if (trust_tier === "sovereign" || trust_tier === "virtual" || credentials.key_algorithm === "tpm-ak") { return "tpm"; }
+  if (credentials.private_key_pem) { return "software"; }
+  return null;
+}
+
+/**
+ * Fetch this identity's per-device certificate chains from the Registrar
+ * (GET /api/v1/identity/devices/certificates, sender-constrained) and store
+ * them in the credentials file, so Mode 1 can package the chain whose leaf is
+ * the key of the device that actually signs. Same as the Python SDK's
+ * sync_device_certificate_chains_from_server(). Returns the stored mapping.
+ */
+export async function sync_device_certificate_chains_from_server(
+  api_base_url?: string | null,
+): Promise<Record<string, unknown>> {
+  const credentials = load_credentials();
+  const effective_api_base_url = api_base_url ?? credentials.api_base_url ?? "https://1id.com";
+  const { get_token } = await import("./auth.js");
+  const { OneIDAPIClient } = await import("./client.js");
+  const token = await get_token(false, credentials);
+  const response = await new OneIDAPIClient(effective_api_base_url).make_authenticated_request(
+    "GET", "/api/v1/identity/devices/certificates", token,
+  );
+  const device_chains = (response["device_certificate_chains"] as Record<string, unknown>) ?? {};
+  if (Object.keys(device_chains).length === 0) { return {}; }
+  credentials.device_certificate_chains = device_chains;
+  save_credentials(credentials);
+  return device_chains;
 }
 
 /**

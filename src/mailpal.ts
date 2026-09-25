@@ -48,8 +48,9 @@ import {
   _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING,
   type AttestationProof,
   type DirectAttestationProof,
+  _fetch_binding_jws,
 } from "./attestation.js";
-import { AuthenticationError, NetworkError, NotEnrolledError } from "./exceptions.js";
+import { AttestationGenerationError, AuthenticationError, NetworkError, NotEnrolledError } from "./exceptions.js";
 
 const _MAILPAL_API_BASE_URL = "https://mailpal.com";
 const _HTTP_TIMEOUT_MILLISECONDS = 30_000;
@@ -138,6 +139,14 @@ export interface SendOptions {
   smtp_security?: "starttls" | "tls" | "none" | null;
   smtp_envelope_from?: string | null;
   deliver?: boolean;
+  /** Phase 3: sign Mode 1 with this device ("piv" | "tpm" | "enclave" | "software")
+   *  instead of the enrolled local default (e.g. a plugged-in YubiKey). */
+  signing_device_type?: "piv" | "enclave" | "tpm" | "software" | null;
+  /** Phase 4: sign with the YubiKey with this serial number (multi-YubiKey). */
+  piv_serial_number?: number | null;
+  /** AUD-F28: when a requested proof cannot be produced, throw
+   *  AttestationGenerationError instead of sending without it (default true). */
+  require_requested_attestation?: boolean;
 }
 
 export interface ActivateOptions {
@@ -248,9 +257,89 @@ async function _get_bearer_auth_headers(): Promise<Token> {
 // RFC 2047 / MIME helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * RFC 2047 "B" encoding for a non-ASCII header phrase (Subject, display name),
+ * split into encoded-words of at most 75 characters (whole UTF-8 characters per
+ * word) joined by folding whitespace, as Python's email package does. ASCII text
+ * is returned unchanged.
+ */
 function _encode_as_rfc2047_base64_if_non_ascii(text: string): string {
-  if (/^[\x20-\x7e]*$/.test(text)) { return text; }
-  return "=?utf-8?b?" + Buffer.from(text, "utf-8").toString("base64") + "?=";
+  if (/^[\x20-\x7e\t]*$/.test(text)) { return text; }
+  const maximum_utf8_octets_per_encoded_word = 45; // 60 base64 chars + 12 = 72 <= 75
+  const encoded_words: string[] = [];
+  let current_chunk = "";
+  for (const character of text) {
+    if (Buffer.byteLength(current_chunk + character, "utf-8") > maximum_utf8_octets_per_encoded_word) {
+      encoded_words.push("=?utf-8?b?" + Buffer.from(current_chunk, "utf-8").toString("base64") + "?=");
+      current_chunk = "";
+    }
+    current_chunk += character;
+  }
+  if (current_chunk) {
+    encoded_words.push("=?utf-8?b?" + Buffer.from(current_chunk, "utf-8").toString("base64") + "?=");
+  }
+  return encoded_words.join("\r\n ");
+}
+
+/** AUD-F84: a caller-supplied header value, address, message id or attachment
+ * field must not carry CR or LF (they would inject headers or SMTP commands). */
+export function reject_header_injection_in_caller_supplied_value(field_name: string, value: string | null | undefined): void {
+  if (value != null && /[\r\n]/.test(value)) {
+    throw new Error(`${field_name} may not contain CR or LF characters (header injection refused)`);
+  }
+}
+
+/** Addresses and message ids must be ASCII (no SMTPUTF8 negotiation here). */
+function _require_ascii_header_token(field_name: string, value: string): void {
+  if (!/^[\x21-\x7e]*$/.test(value.replace(/[ \t]/g, ""))) {
+    throw new Error(`${field_name} must be ASCII (non-ASCII addresses/message ids are not supported): ${JSON.stringify(value)}`);
+  }
+}
+
+/** To / Cc / Reply-To value: each "Name <addr>" or bare address; non-ASCII
+ * display names RFC 2047-encoded, addresses required to be ASCII. */
+function _format_address_list_header_value(field_name: string, addresses: string[]): string {
+  return addresses.map((address_string) => {
+    const { display_name, email } = _parse_address_into_name_and_email(address_string);
+    _require_ascii_header_token(field_name, email);
+    return _format_email_address_with_optional_display_name(display_name, email);
+  }).join(", ");
+}
+
+/** AUD-F75: every text body part is quoted-printable (RFC 2045 6.7) with CRLF
+ * hard line breaks and soft breaks keeping lines under 76 characters -- the
+ * same transfer encoding the Python SDK forces for Stalwart compatibility
+ * (_FORCED_CTE_FOR_STALWART_COMPAT), so both SDKs emit equivalent bodies. */
+function _encode_text_body_for_mime_part(body_text: string): { content_transfer_encoding: string; encoded_body: string } {
+  const encode_one_line = (line: string): string => {
+    const line_bytes = Buffer.from(line, "utf-8");
+    let encoded_line = "";
+    let current_length = 0;
+    for (let index = 0; index < line_bytes.length; index++) {
+      const octet = line_bytes[index];
+      const is_last_octet_of_line = index === line_bytes.length - 1;
+      const literal = (octet >= 33 && octet <= 126 && octet !== 61) || ((octet === 32 || octet === 9) && !is_last_octet_of_line);
+      const token = literal ? String.fromCharCode(octet) : "=" + octet.toString(16).toUpperCase().padStart(2, "0");
+      if (current_length + token.length > 75) {
+        encoded_line += "=\r\n";
+        current_length = 0;
+      }
+      encoded_line += token;
+      current_length += token.length;
+    }
+    return encoded_line;
+  };
+  const encoded_body = body_text.replace(/\r\n|\r|\n/g, "\n").split("\n").map(encode_one_line).join("\r\n");
+  return { content_transfer_encoding: "quoted-printable", encoded_body };
+}
+
+/** AUD-F29: RFC 5321 4.5.2 transparency -- a line starting with "." gets a
+ * second "."; the data ends with CRLF "." CRLF (one CRLF added only when the
+ * message does not already end with one, like smtplib). Byte-preserving. */
+export function prepare_message_bytes_for_smtp_data_transmission(message_bytes: Buffer): Buffer {
+  let transmitted_text = message_bytes.toString("latin1").replace(/(^|\r\n)\./g, "$1..");
+  if (!transmitted_text.endsWith("\r\n")) { transmitted_text += "\r\n"; }
+  return Buffer.from(transmitted_text + ".\r\n", "latin1");
 }
 
 function _format_email_address_with_optional_display_name(
@@ -321,9 +410,10 @@ function _build_mime_message_as_wire_format_bytes(
     } else {
       header_lines.push('Content-Type: text/plain; charset="utf-8"');
     }
-    header_lines.push("Content-Transfer-Encoding: 7bit");
+    const single_part = _encode_text_body_for_mime_part(html_body || body_text);
+    header_lines.push(`Content-Transfer-Encoding: ${single_part.content_transfer_encoding}`);
     const header_section = header_lines.join("\r\n");
-    return Buffer.from(header_section + "\r\n\r\n" + (html_body || body_text) + "\r\n", "utf-8");
+    return Buffer.from(header_section + "\r\n\r\n" + single_part.encoded_body + "\r\n", "utf-8");
   }
 
   const mixed_boundary = _generate_mime_boundary();
@@ -336,13 +426,15 @@ function _build_mime_message_as_wire_format_bytes(
     const alt_boundary = _generate_mime_boundary();
     parts.push(`Content-Type: multipart/alternative; boundary="${alt_boundary}"\r\n`);
     parts.push(`\r\n--${alt_boundary}\r\n`);
+    const plain_part = _encode_text_body_for_mime_part(body_text);
     parts.push('Content-Type: text/plain; charset="utf-8"\r\n');
-    parts.push("Content-Transfer-Encoding: 7bit\r\n");
-    parts.push(`\r\n${body_text}\r\n`);
+    parts.push(`Content-Transfer-Encoding: ${plain_part.content_transfer_encoding}\r\n`);
+    parts.push(`\r\n${plain_part.encoded_body}\r\n`);
     parts.push(`\r\n--${alt_boundary}\r\n`);
+    const html_part = _encode_text_body_for_mime_part(html_body!);
     parts.push('Content-Type: text/html; charset="utf-8"\r\n');
-    parts.push("Content-Transfer-Encoding: 7bit\r\n");
-    parts.push(`\r\n${html_body}\r\n`);
+    parts.push(`Content-Transfer-Encoding: ${html_part.content_transfer_encoding}\r\n`);
+    parts.push(`\r\n${html_part.encoded_body}\r\n`);
     parts.push(`\r\n--${alt_boundary}--\r\n`);
   } else {
     if (html_body) {
@@ -350,8 +442,9 @@ function _build_mime_message_as_wire_format_bytes(
     } else {
       parts.push('Content-Type: text/plain; charset="utf-8"\r\n');
     }
-    parts.push("Content-Transfer-Encoding: 7bit\r\n");
-    parts.push(`\r\n${html_body || body_text}\r\n`);
+    const only_part = _encode_text_body_for_mime_part(html_body || body_text);
+    parts.push(`Content-Transfer-Encoding: ${only_part.content_transfer_encoding}\r\n`);
+    parts.push(`\r\n${only_part.encoded_body}\r\n`);
   }
 
   if (has_attachments) {
@@ -623,8 +716,7 @@ function _send_raw_message_via_smtp_with_starttls(
         if (code !== 354) { return reject(new NetworkError(`SMTP DATA command failed: ${line}`)); }
         phase = "data_done";
         const active_socket = secure_socket ?? socket;
-        active_socket.write(message_bytes);
-        active_socket.write(Buffer.from("\r\n.\r\n"));
+        active_socket.write(prepare_message_bytes_for_smtp_data_transmission(message_bytes));
       } else if (phase === "data_done") {
         if (code !== 250) { return reject(new NetworkError(`SMTP message rejected: ${line}`)); }
         phase = "quit";
@@ -719,8 +811,7 @@ function _send_raw_message_via_smtp_with_direct_tls(
       } else if (phase === "data_cmd") {
         if (code !== 354) { return reject(new NetworkError(`SMTP DATA command failed: ${line}`)); }
         phase = "data_done";
-        socket.write(message_bytes);
-        socket.write(Buffer.from("\r\n.\r\n"));
+        socket.write(prepare_message_bytes_for_smtp_data_transmission(message_bytes));
       } else if (phase === "data_done") {
         if (code !== 250) { return reject(new NetworkError(`SMTP message rejected: ${line}`)); }
         phase = "quit";
@@ -808,8 +899,7 @@ function _send_raw_message_via_plain_smtp_without_encryption(
       } else if (phase === "data_cmd") {
         if (code !== 354) { return reject(new NetworkError(`SMTP DATA command failed: ${line}`)); }
         phase = "data_done";
-        socket.write(message_bytes);
-        socket.write(Buffer.from("\r\n.\r\n"));
+        socket.write(prepare_message_bytes_for_smtp_data_transmission(message_bytes));
       } else if (phase === "data_done") {
         if (code !== 250) { return reject(new NetworkError(`SMTP message rejected: ${line}`)); }
         phase = "quit";
@@ -1011,7 +1101,27 @@ export async function send(options: SendOptions): Promise<SendResult> {
     smtp_security = null,
     smtp_envelope_from = null,
     deliver = true,
+    signing_device_type = null,
+    piv_serial_number = null,
+    require_requested_attestation = true,
   } = options;
+
+  // AUD-F84: refuse CR/LF in anything that becomes a header or an SMTP command.
+  reject_header_injection_in_caller_supplied_value("subject", subject);
+  reject_header_injection_in_caller_supplied_value("from_address", from_address);
+  reject_header_injection_in_caller_supplied_value("from_display_name", from_display_name);
+  reject_header_injection_in_caller_supplied_value("reply_to", reply_to);
+  reject_header_injection_in_caller_supplied_value("in_reply_to", in_reply_to);
+  reject_header_injection_in_caller_supplied_value("references", references);
+  reject_header_injection_in_caller_supplied_value("smtp_envelope_from", smtp_envelope_from);
+  for (const [list_name, address_list] of [["to", to], ["cc", cc ?? []], ["bcc", bcc ?? []]] as Array<[string, string[]]>) {
+    for (const address of address_list) { reject_header_injection_in_caller_supplied_value(list_name, address); }
+  }
+  for (const attachment of attachments ?? []) {
+    reject_header_injection_in_caller_supplied_value("attachment filename", attachment.filename);
+    reject_header_injection_in_caller_supplied_value("attachment content_type", attachment.content_type);
+    reject_header_injection_in_caller_supplied_value("attachment content_id", attachment.content_id);
+  }
 
   const creds = load_credentials();
 
@@ -1041,21 +1151,23 @@ export async function send(options: SendOptions): Promise<SendResult> {
 
   const ordered_mime_headers: Array<[string, string]> = [
     ["From", from_header_value],
-    ["To", to.join(", ")],
-    ["Subject", subject],
+    ["To", _format_address_list_header_value("To", to)],
+    ["Subject", _encode_as_rfc2047_base64_if_non_ascii(subject)],
     ["Date", date_header],
     ["Message-ID", message_id],
   ];
   if (cc && cc.length > 0) {
-    ordered_mime_headers.push(["Cc", cc.join(", ")]);
+    ordered_mime_headers.push(["Cc", _format_address_list_header_value("Cc", cc)]);
   }
   if (reply_to) {
-    ordered_mime_headers.push(["Reply-To", reply_to]);
+    ordered_mime_headers.push(["Reply-To", _format_address_list_header_value("Reply-To", [reply_to])]);
   }
   if (in_reply_to) {
+    _require_ascii_header_token("In-Reply-To", in_reply_to);
     ordered_mime_headers.push(["In-Reply-To", in_reply_to]);
   }
   if (references) {
+    _require_ascii_header_token("References", references);
     ordered_mime_headers.push(["References", references]);
   }
 
@@ -1089,20 +1201,57 @@ export async function send(options: SendOptions): Promise<SendResult> {
   const include_sd_jwt_mode = attestation_mode === "sd-jwt" || attestation_mode === "both";
   const include_direct_mode = attestation_mode === "direct" || attestation_mode === "both";
 
-  // AUD-F47: in Combined mode the Mode 2 issuance carries the Mode 1 proof key
-  // as cnf.jwk. (Node sends no Registrar binding, so its Mode 1 carries no aid
-  // and Mode 2 needs no sub disclosure; AUD-F48 applies only with a binding.)
+  // AUD-F28: why each requested piece is missing (checked before sending).
+  const attestation_failure_reasons: string[] = [];
+
+  // Mode 1's proof key and Registrar binding come FIRST (same order as the
+  // Python SDK): in Combined mode the Mode 2 issuance must carry that key as
+  // cnf.jwk (AUD-F47) and must disclose sub whenever Mode 1 carries aid (AUD-F48).
   const combined_mode_is_requested = include_sd_jwt_mode && include_direct_mode;
-  const combined_mode_proof_key_jwk = combined_mode_is_requested && creds.identity_certificate_chain_pem
-    ? public_key_jwk_of_certificate_chain_leaf(creds.identity_certificate_chain_pem)
-    : null;
+  let fetched_binding_jws: string | null = null;
+  let proof_public_key_jwk: Record<string, unknown> | null = null;
+  if (effective_include_attestation && include_direct_mode) {
+    let certificate_chain_for_binding_jws = creds.identity_certificate_chain_pem ?? null;
+    if (signing_device_type && creds.device_certificate_chains) {
+      for (const chain_data of Object.values(creds.device_certificate_chains)) {
+        if (chain_data != null && typeof chain_data === "object"
+            && (chain_data as Record<string, unknown>)["device_type"] === signing_device_type) {
+          certificate_chain_for_binding_jws = ((chain_data as Record<string, unknown>)["certificate_chain_pem"] as string)
+            ?? certificate_chain_for_binding_jws;
+          break;
+        }
+      }
+    }
+    if (certificate_chain_for_binding_jws) {
+      proof_public_key_jwk = public_key_jwk_of_certificate_chain_leaf(certificate_chain_for_binding_jws);
+    }
+    if (proof_public_key_jwk && creds.agent_identity_urn) {
+      try {
+        const token_for_binding = await get_token();
+        const api_base = oneid_api_url ?? creds.api_base_url ?? "https://1id.com";
+        fetched_binding_jws = await _fetch_binding_jws(api_base, token_for_binding, proof_public_key_jwk);
+        if (!fetched_binding_jws) {
+          console.warn("[oneid.mailpal] Binding JWS not available; Mode 1 will lack aid and bind");
+          attestation_failure_reasons.push("Registrar binding JWS for Mode 1 was not available");
+        }
+      } catch (binding_error) {
+        console.warn(`[oneid.mailpal] Failed to fetch binding JWS: ${binding_error}`);
+        attestation_failure_reasons.push(`Registrar binding JWS for Mode 1 could not be fetched: ${binding_error}`);
+      }
+    }
+  }
+  const combined_mode_proof_key_jwk = combined_mode_is_requested ? proof_public_key_jwk : null;
   const request_and_fold_mode2_proof = async (
     cnf_jwk_for_combined_mode: Record<string, unknown> | null,
   ): Promise<[AttestationProof, string | null]> => {
+    const requested_disclosed_claims: string[] = disclosed_claims ? [...disclosed_claims] : ["aid"];
+    if (cnf_jwk_for_combined_mode && fetched_binding_jws && !requested_disclosed_claims.includes("sub")) {
+      requested_disclosed_claims.push("sub");
+    }
     const issued_proof = await prepareAttestation({
       emailHeaders: wire_format_headers_for_mode2_nonce,
       body: wire_format_body_bytes,
-      disclosedClaims: disclosed_claims ?? undefined,
+      disclosedClaims: requested_disclosed_claims,
       apiBaseUrl: oneid_api_url ?? undefined,
       cnfJwk: cnf_jwk_for_combined_mode ?? undefined,
     });
@@ -1121,6 +1270,7 @@ export async function send(options: SendOptions): Promise<SendResult> {
       mode2_carries_combined_mode_cnf = combined_mode_proof_key_jwk !== null;
     } catch (attestation_error) {
       console.warn(`[oneid.mailpal] Mode 2 (SD-JWT) attestation failed: ${attestation_error}`);
+      attestation_failure_reasons.push(`Mode 2 (Hardware-Trust-Proof) failed: ${attestation_error}`);
     }
   }
 
@@ -1135,10 +1285,31 @@ export async function send(options: SendOptions): Promise<SendResult> {
   if (effective_include_attestation && include_direct_mode) {
     try {
       mode1_direct_attestation_proof = await prepare_direct_hardware_attestation(
-        wire_format_headers, wire_format_body_bytes,
+        wire_format_headers, wire_format_body_bytes, undefined, fetched_binding_jws ?? undefined,
+        signing_device_type, piv_serial_number ?? undefined,
       );
     } catch (mode1_error) {
       console.warn(`[oneid.mailpal] Mode 1 (Direct Hardware) attestation failed: ${mode1_error}`);
+      attestation_failure_reasons.push(`Mode 1 (Hardware-Attestation) failed: ${mode1_error}`);
+    }
+  }
+
+  // AUD-F28: the caller asked for these proofs; do not silently send without them.
+  if (effective_include_attestation && require_requested_attestation) {
+    if (include_direct_mode && mode1_direct_attestation_proof === null
+        && !attestation_failure_reasons.some((reason) => reason.startsWith("Mode 1"))) {
+      attestation_failure_reasons.push("Mode 1 (Hardware-Attestation) produced no proof");
+    }
+    if (include_sd_jwt_mode && mode2_sd_jwt_proof === null
+        && !attestation_failure_reasons.some((reason) => reason.startsWith("Mode 2"))) {
+      attestation_failure_reasons.push("Mode 2 (Hardware-Trust-Proof) produced no proof");
+    }
+    if (attestation_failure_reasons.length > 0) {
+      throw new AttestationGenerationError(
+        `Requested attestation_mode='${attestation_mode}' could not be produced, so the message was ` +
+        `not sent: ${attestation_failure_reasons.join("; ")}. ` +
+        "Pass require_requested_attestation: false to send with whatever proofs succeeded.",
+      );
     }
   }
 

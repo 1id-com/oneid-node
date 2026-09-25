@@ -20,7 +20,7 @@
 
 import { SDK_VERSION } from "./version.js";
 import { clear_cached_token, get_token, authenticate_with_tpm, authenticate_with_piv } from "./auth.js";
-import { credentials_exist, load_credentials, save_credentials } from "./credentials.js";
+import { credentials_exist, load_credentials, save_credentials, sync_device_certificate_chains_from_server, local_signing_device_type_for_credentials } from "./credentials.js";
 import { enroll, type EnrollOptions } from "./enroll.js";
 import { sign_challenge_with_private_key } from "./keys.js";
 import {
@@ -53,6 +53,18 @@ import {
   lockHardware,
   registerOperatorEmail,
   DeviceManagementError,
+  DowngradeRejectedError,
+  ColocationRequiredError,
+  ColocationBindingError,
+  ColocationSessionExpiredError,
+  ColocationTimingViolationError,
+  DeviceAlreadyBoundError,
+  LastDeviceBurnRejectedError,
+  BurnConfirmationExpiredError,
+  HardwareLockedError,
+  IdentityAlreadyLockedError,
+  DeclaredTierCannotBeLockedError,
+  TooManyActiveDevicesForLockError,
   type DeviceInfo,
   type DeviceListResult,
   type DeviceAddResult,
@@ -67,6 +79,11 @@ import {
   CertificateChainValidationError,
   SignatureVerificationError,
   MissingIdentityCertificateError,
+  RegistrarAuthorityValidationError,
+  PeerVerificationTemporarilyUnavailableError,
+  resolve_agent_identity_at_airs_registry,
+  sign_challenge,
+  verify_peer_identity,
   type IdentityProofBundle,
   type VerifiedPeerIdentity,
 } from "./verify.js";
@@ -124,6 +141,7 @@ export {
   HandleRetiredError,
   AuthenticationError,
   HardwareDeviceNotPresentError,
+  AttestationGenerationError,
   NetworkError,
   NotEnrolledError,
   BinaryNotFoundError,
@@ -158,6 +176,18 @@ export {
 // Re-export device management types and error
 export {
   DeviceManagementError,
+  DowngradeRejectedError,
+  ColocationRequiredError,
+  ColocationBindingError,
+  ColocationSessionExpiredError,
+  ColocationTimingViolationError,
+  DeviceAlreadyBoundError,
+  LastDeviceBurnRejectedError,
+  BurnConfirmationExpiredError,
+  HardwareLockedError,
+  IdentityAlreadyLockedError,
+  DeclaredTierCannotBeLockedError,
+  TooManyActiveDevicesForLockError,
   type DeviceInfo,
   type DeviceListResult,
   type DeviceAddResult,
@@ -176,6 +206,11 @@ export {
   CertificateChainValidationError,
   SignatureVerificationError,
   MissingIdentityCertificateError,
+  RegistrarAuthorityValidationError,
+  PeerVerificationTemporarilyUnavailableError,
+  resolve_agent_identity_at_airs_registry,
+  sign_challenge,
+  verify_peer_identity,
   type IdentityProofBundle,
   type VerifiedPeerIdentity,
 };
@@ -271,13 +306,13 @@ export function whoami(): Identity {
   const canonical_id = creds.client_id;
   const handle = canonical_id.startsWith("@") ? canonical_id : `@${canonical_id}`;
 
-  // Determine HSM type from credentials
-  let hsm_type: HSMType | null = null;
-  if (creds.private_key_pem != null) {
-    hsm_type = HSMType.SOFTWARE;
-  } else if (creds.hsm_key_reference != null) {
-    hsm_type = HSMType.TPM;
-  }
+  // AUD-F59: the enrolled local device (same rule as login and signing), not
+  // "any key reference is a TPM". Same mapping as the Python SDK.
+  const device_type = local_signing_device_type_for_credentials(creds);
+  const hsm_type: HSMType | null = device_type === "piv" ? HSMType.YUBIKEY
+    : device_type === "enclave" ? HSMType.SECURE_ENCLAVE
+    : device_type === "tpm" ? HSMType.TPM
+    : device_type === "software" ? HSMType.SOFTWARE : null;
 
   return {
     canonical_id,
@@ -415,6 +450,9 @@ export {
   authenticate_with_tpm,
   authenticate_with_piv,
   credentials_exist,
+  load_credentials,
+  sync_device_certificate_chains_from_server,
+  local_signing_device_type_for_credentials,
   sign_challenge_with_private_key,
   listDevices,
   addDevice,

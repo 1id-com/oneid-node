@@ -1,28 +1,45 @@
 /**
- * 1id Peer Identity Verification
+ * 1id Peer Identity Verification -- the AIRS online authority model.
  *
- * Assembles and validates proof bundles for offline, privacy-preserving
- * agent-to-agent identity verification.
+ * Rebuilt 2026-09-26 on the drafts' authority model (registry-04 / resolution /
+ * email-hardware-attestation "Registrar Binding JWS"), replacing the old offline
+ * certificate model (AUD-F05, F06, F32, F33, F69, F70, F86). Same protocol and
+ * checks as the Python SDK (oneid/verify.py); bundles are interchangeable.
  *
  * Protocol:
- *   1. Verifier generates a random nonce (32+ bytes)
- *   2. Agent calls signChallenge(nonce) -> IdentityProofBundle
- *   3. Verifier calls verifyPeerIdentity(nonce, bundle)
- *      -> VerifiedPeerIdentity
+ *   1. The verifier generates a random nonce (at least 16 bytes).
+ *   2. The prover calls signChallenge(nonce) -> IdentityProofBundle: a signature
+ *      over the nonce by the ENROLLED key of its local signing device, plus the
+ *      Registrar Binding JWS for that key (iss, sub = the aid URN, cnf.jwk,
+ *      aid.trust_tier), the aid URN and the algorithm.
+ *   3. The verifier calls verifyPeerIdentity(nonce, bundle):
+ *        a. resolve the aid at the AIRS Registry (RDAP): the answer must name
+ *           exactly this aid and be operational (currentIssuer, hardwareLocked,
+ *           registration date);
+ *        b. the binding JWS: typ, asymmetric alg, sub == aid, iat/exp current,
+ *           cnf.jwk public only, iss == currentIssuer, signed by a key from THAT
+ *           issuer's RFC 8414 metadata jwks_uri (never from the bundle);
+ *        c. the nonce signature with cnf.jwk.
+ *      Trust tier comes only from the Registrar-signed binding and identity facts
+ *      only from the Registry -- never from the bundle.
  *
- * No secrets are exchanged. The verifier never contacts 1ID. Once the
- * trust root is cached locally, verification is entirely offline.
+ * Online by design (a decommissioned identity fails). For air-gapped use pass
+ * current_issuer_resolver / issuer_jwk_set_provider with pre-fetched answers.
  */
 
 import * as crypto from "node:crypto";
-import { load_credentials, type StoredCredentials } from "./credentials.js";
+import { load_credentials, local_signing_device_type_for_credentials, type StoredCredentials } from "./credentials.js";
 import { NotEnrolledError, OneIDError } from "./exceptions.js";
 import { sign_challenge_with_private_key } from "./keys.js";
-import { get_trust_roots, parse_pem_bundle_into_certificates } from "./trustRoots.js";
 
-const ONEID_OID_TRUST_TIER = "1.3.6.1.4.1.59999.1.1";
-const ONEID_OID_ENROLLED_AT = "1.3.6.1.4.1.59999.1.2";
-const ONEID_OID_HARDWARE_LOCKED = "1.3.6.1.4.1.59999.1.3";
+export const AIRS_RDAP_BASE_URL = "https://airs.1id.biz";
+export const REGISTRAR_BINDING_JWS_TYP = "airs-email-binding+jwt";
+const ACCEPTED_BINDING_JWS_ALGORITHMS = ["ES256", "RS256", "PS256"];
+const NETWORK_TIMEOUT_MILLISECONDS = 10_000;
+const RFC8414_JWK_SET_CACHE_MILLISECONDS = 300_000;
+const issuer_jwk_set_cache = new Map<string, { fetched_at: number; keys: Array<Record<string, unknown>> }>();
+const AID_URN_PATTERN = /^urn:aid:[a-z0-9-]+:id-[a-z]{5}(-[a-z]{5}){3}$/;
+const VALID_TRUST_TIERS = ["sovereign", "portable", "enclave", "virtual", "declared"];
 
 export class PeerVerificationError extends OneIDError {
   constructor(message: string, error_code: string = "PEER_VERIFICATION_ERROR") {
@@ -31,10 +48,25 @@ export class PeerVerificationError extends OneIDError {
   }
 }
 
-export class CertificateChainValidationError extends PeerVerificationError {
+/** The peer's identity authority could not be established: the Registry does not
+ * resolve the aid to an operational identity, or the Registrar binding is invalid. */
+export class RegistrarAuthorityValidationError extends PeerVerificationError {
   constructor(message: string) {
-    super(message, "CERTIFICATE_CHAIN_VALIDATION_ERROR");
-    this.name = "CertificateChainValidationError";
+    super(message, "REGISTRAR_AUTHORITY_VALIDATION_ERROR");
+    this.name = "RegistrarAuthorityValidationError";
+  }
+}
+
+/** The old certificate-model name, kept so existing catch/instanceof code works. */
+export const CertificateChainValidationError = RegistrarAuthorityValidationError;
+export type CertificateChainValidationError = RegistrarAuthorityValidationError;
+
+/** Registry resolution or issuer key retrieval could not complete (network,
+ * timeout, HTTP 429/5xx): neither a pass nor a permanent failure -- retry. */
+export class PeerVerificationTemporarilyUnavailableError extends PeerVerificationError {
+  constructor(message: string) {
+    super(message, "PEER_VERIFICATION_TEMPORARILY_UNAVAILABLE");
+    this.name = "PeerVerificationTemporarilyUnavailableError";
   }
 }
 
@@ -52,21 +84,49 @@ export class MissingIdentityCertificateError extends PeerVerificationError {
   }
 }
 
+/** Assembled by the prover, sent to the verifier (same JSON as Python's to_dict()). */
 export interface IdentityProofBundle {
   signature_b64: string;
-  certificate_chain_pem: string;
-  agent_id: string;
-  trust_tier: string;
+  agent_identity_urn: string;
+  registrar_binding_jws: string;
   algorithm: string;
+  agent_id?: string;
+  /** The prover's claim; informational only (never trusted). */
+  trust_tier?: string;
+  /** Carried for SDK <= 3.1.1 verifiers; not used. */
+  certificate_chain_pem?: string;
 }
 
+/** Every field comes from the Registry (RDAP) or the Registrar-signed binding. */
 export interface VerifiedPeerIdentity {
   agent_id: string;
   trust_tier: string;
   enrolled_at: string;
   hardware_locked: boolean;
+  /** True: the Registry -> issuer -> binding -> key chain verified. */
   chain_valid: boolean;
+  agent_identity_urn: string;
+  issuer: string;
+  registrar_binding_expires_at: number;
 }
+
+export interface RegistryResolutionOfAgentIdentity {
+  current_issuer: string;
+  hardware_locked: boolean;
+  registered_at: string;
+  max_active_trust_tier: string;
+}
+
+export interface VerifyPeerIdentityOptions {
+  current_issuer_resolver?: (aid: string) => Promise<RegistryResolutionOfAgentIdentity> | RegistryResolutionOfAgentIdentity;
+  issuer_jwk_set_provider?: (issuer: string) => Promise<Array<Record<string, unknown>>> | Array<Record<string, unknown>>;
+  reference_time_unix?: number;
+  max_clock_skew_seconds?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Prover side
+// ---------------------------------------------------------------------------
 
 export function determine_signing_algorithm_name(creds: StoredCredentials): string {
   const algo = (creds.key_algorithm ?? "").toLowerCase();
@@ -79,22 +139,22 @@ export function determine_signing_algorithm_name(creds: StoredCredentials): stri
 
 async function sign_with_tpm(nonce_bytes: Buffer, ak_handle: string): Promise<{ signature_bytes: Buffer; algorithm: string }> {
   const { sign_challenge_with_tpm } = await import("./helper.js");
-  const nonce_b64 = nonce_bytes.toString("base64");
-  const result = await sign_challenge_with_tpm(nonce_b64, ak_handle);
-  const signature_b64 = (result["signature_b64"] as string) ?? "";
+  const result = await sign_challenge_with_tpm(nonce_bytes.toString("base64"), ak_handle);
   const algorithm_raw = (result["algorithm"] as string) ?? "RSASSA-SHA256";
-  const algorithm = algorithm_raw.toUpperCase().includes("RSA") ? "RS256" : algorithm_raw;
-  return { signature_bytes: Buffer.from(signature_b64, "base64"), algorithm };
+  return {
+    signature_bytes: Buffer.from((result["signature_b64"] as string) ?? "", "base64"),
+    algorithm: algorithm_raw.toUpperCase().includes("RSA") ? "RS256" : algorithm_raw,
+  };
 }
 
-async function sign_with_piv(nonce_bytes: Buffer): Promise<{ signature_bytes: Buffer; algorithm: string }> {
+async function sign_with_piv(nonce_bytes: Buffer, piv_serial_number?: number): Promise<{ signature_bytes: Buffer; algorithm: string }> {
   const { sign_challenge_with_piv } = await import("./helper.js");
-  const nonce_b64 = nonce_bytes.toString("base64");
-  const result = await sign_challenge_with_piv(nonce_b64);
-  const signature_b64 = (result["signature_b64"] as string) ?? "";
+  const result = await sign_challenge_with_piv(nonce_bytes.toString("base64"), piv_serial_number);
   const algorithm_raw = (result["algorithm"] as string) ?? "ECDSA-SHA256";
-  const algorithm = algorithm_raw.toUpperCase().includes("ECDSA") ? "ES256" : algorithm_raw;
-  return { signature_bytes: Buffer.from(signature_b64, "base64"), algorithm };
+  return {
+    signature_bytes: Buffer.from((result["signature_b64"] as string) ?? "", "base64"),
+    algorithm: algorithm_raw.toUpperCase().includes("ECDSA") ? "ES256" : algorithm_raw,
+  };
 }
 
 async function sign_with_enclave(
@@ -103,308 +163,352 @@ async function sign_with_enclave(
 ): Promise<{ signature_bytes: Buffer; algorithm: string }> {
   const { sign_challenge_with_enclave } = await import("./helper.js");
   const { restore_enclave_key_file_from_credentials_if_missing } = await import("./enroll.js");
-
   if (enclave_key_data_representation_b64) {
     restore_enclave_key_file_from_credentials_if_missing(enclave_key_data_representation_b64);
   }
-
-  const nonce_b64 = nonce_bytes.toString("base64");
-  const result = await sign_challenge_with_enclave(nonce_b64);
-  const signature_b64 = (result["signature_b64"] as string) ?? "";
-  return { signature_bytes: Buffer.from(signature_b64, "base64"), algorithm: "ES256" };
+  const result = await sign_challenge_with_enclave(nonce_bytes.toString("base64"));
+  return { signature_bytes: Buffer.from((result["signature_b64"] as string) ?? "", "base64"), algorithm: "ES256" };
 }
 
 /**
- * Sign a verifier-provided nonce and assemble a proof bundle.
- *
- * Dispatches to the appropriate signing mechanism based on trust tier:
- *   - sovereign (TPM): delegates to oneid-enroll sign
- *   - portable (YubiKey): delegates to oneid-enroll piv-sign
- *   - declared (software): signs with local private key
- *
- * @param nonce_bytes Raw bytes of the verifier-generated nonce.
- * @returns IdentityProofBundle ready to send to the verifier.
+ * Sign a verifier-provided nonce and assemble a proof bundle. The ENROLLED LOCAL
+ * DEVICE signs (hsm_key_reference first, tier only as fallback -- the rule login
+ * and Mode 1 use) unless signing_device_type selects one. The bundle carries the
+ * Registrar Binding JWS for exactly the key that signed. Same as Python sign_challenge().
  */
-export async function signChallenge(nonce_bytes: Buffer): Promise<IdentityProofBundle> {
+export async function signChallenge(
+  nonce_bytes: Buffer,
+  signing_device_type?: "tpm" | "piv" | "enclave" | "software" | null,
+  piv_serial_number?: number,
+): Promise<IdentityProofBundle> {
+  const { certificate_chain_leaf_key_verifies_mode1_signature, public_key_jwk_of_certificate_chain_leaf, _fetch_binding_jws } =
+    await import("./attestation.js");
+  const { get_token } = await import("./auth.js");
   const creds = load_credentials();
-
   if (!creds.identity_certificate_chain_pem) {
     throw new MissingIdentityCertificateError(
-      "No identity certificate chain found in credentials. " +
-      "This agent was enrolled before certificate issuance was available. " +
-      "Re-enroll or recover your identity to obtain a certificate."
-    );
+      "No identity certificate chain found in credentials. Re-enroll or recover your identity to obtain a certificate.");
+  }
+  if (!creds.agent_identity_urn) {
+    throw new NotEnrolledError("These credentials have no agent identity URN; re-enroll to obtain one.");
   }
 
-  const trust_tier = creds.trust_tier ?? "declared";
-  const agent_id = creds.client_id;
+  const device_type = signing_device_type ?? local_signing_device_type_for_credentials(creds);
   let signature_bytes: Buffer;
   let algorithm: string;
-
-  if (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") {
-    const ak_handle = creds.hsm_key_reference ?? "";
-    const result = await sign_with_tpm(nonce_bytes, ak_handle);
-    signature_bytes = result.signature_bytes;
-    algorithm = result.algorithm;
-  } else if (trust_tier === "portable" || creds.hsm_key_reference === "piv-slot-9a") {
-    const result = await sign_with_piv(nonce_bytes);
-    signature_bytes = result.signature_bytes;
-    algorithm = result.algorithm;
-  } else if (trust_tier === "enclave") {
-    const result = await sign_with_enclave(
-      nonce_bytes,
-      creds.enclave_key_data_representation_b64,
-    );
-    signature_bytes = result.signature_bytes;
-    algorithm = result.algorithm;
-  } else if (creds.private_key_pem) {
+  if (device_type === "tpm") {
+    ({ signature_bytes, algorithm } = await sign_with_tpm(nonce_bytes, creds.hsm_key_reference ?? ""));
+  } else if (device_type === "piv") {
+    ({ signature_bytes, algorithm } = await sign_with_piv(nonce_bytes, piv_serial_number));
+  } else if (device_type === "enclave") {
+    ({ signature_bytes, algorithm } = await sign_with_enclave(nonce_bytes, creds.enclave_key_data_representation_b64));
+  } else if (device_type === "software" && creds.private_key_pem) {
     signature_bytes = sign_challenge_with_private_key(creds.private_key_pem, nonce_bytes);
     algorithm = determine_signing_algorithm_name(creds);
   } else {
     throw new NotEnrolledError(
       "Cannot sign challenge: no signing key available. " +
-      "Credentials exist but contain neither a private key nor an HSM reference."
-    );
+      "Credentials exist but contain neither a private key nor an HSM reference.");
+  }
+  if (!ACCEPTED_BINDING_JWS_ALGORITHMS.includes(algorithm)) {
+    throw new PeerVerificationError(
+      `A ${algorithm} key cannot carry a Registrar binding (ES256 / RS256 / PS256 only); enroll a declared ` +
+      "identity with key_algorithm 'ecdsa-p256' (the default) or use a hardware tier.");
   }
 
+  const candidate_chains: string[] = [];
+  for (const chain_data of Object.values(creds.device_certificate_chains ?? {})) {
+    const chain_pem = typeof chain_data === "string" ? chain_data : (chain_data as Record<string, unknown> | null)?.["certificate_chain_pem"];
+    if (typeof chain_pem === "string" && chain_pem && !candidate_chains.includes(chain_pem)) { candidate_chains.push(chain_pem); }
+  }
+  candidate_chains.push(creds.identity_certificate_chain_pem);
+  const signing_chain = candidate_chains.find((chain) =>
+    certificate_chain_leaf_key_verifies_mode1_signature(chain, nonce_bytes, signature_bytes, algorithm));
+  if (signing_chain === undefined) {
+    throw new PeerVerificationError(
+      "No stored certificate chain holds the key that signed; re-sync device certificates " +
+      "(sync_device_certificate_chains_from_server) or re-enroll.");
+  }
+  const signing_key_jwk = public_key_jwk_of_certificate_chain_leaf(signing_chain);
+  if (signing_key_jwk == null) {
+    throw new PeerVerificationError("The signing key cannot be expressed as a JWK for the Registrar binding.");
+  }
+  const token = await get_token(false, creds);
+  const binding_jws = await _fetch_binding_jws(creds.api_base_url || "https://1id.com", token, signing_key_jwk);
+  if (!binding_jws) {
+    throw new PeerVerificationError("The Registrar did not issue a binding for the signing key; try again.");
+  }
   return {
     signature_b64: signature_bytes.toString("base64"),
-    certificate_chain_pem: creds.identity_certificate_chain_pem,
-    agent_id,
-    trust_tier,
+    agent_identity_urn: creds.agent_identity_urn,
+    registrar_binding_jws: binding_jws,
     algorithm,
+    agent_id: creds.client_id,
+    trust_tier: creds.trust_tier ?? "",
+    certificate_chain_pem: signing_chain,
   };
 }
 
+// ---------------------------------------------------------------------------
+// Verifier side
+// ---------------------------------------------------------------------------
+
+class PermanentHttpError extends Error {
+  constructor(public readonly status: number, url: string) { super(`${url}: HTTP ${status}`); }
+}
+
+async function fetch_json_document(url: string, accept: string = "application/json"): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: { Accept: accept }, signal: AbortSignal.timeout(NETWORK_TIMEOUT_MILLISECONDS) });
+  } catch (network_error) {
+    throw new PeerVerificationTemporarilyUnavailableError(`${url}: ${network_error}`);
+  }
+  if (response.status === 429 || response.status >= 500) {
+    throw new PeerVerificationTemporarilyUnavailableError(`${url}: HTTP ${response.status}`);
+  }
+  if (!response.ok) { throw new PermanentHttpError(response.status, url); }
+  return await response.json();
+}
+
 /**
- * Extract the value of a custom extension by OID from a certificate.
- * Node.js X509Certificate doesn't expose arbitrary extensions directly,
- * so we parse the raw DER to find it.
+ * Resolve an aid at the AIRS Registry (RDAP) with the Resolution draft's checks:
+ * the answer names exactly this aid and it is operational. Same as Python
+ * resolve_agent_identity_at_airs_registry().
  */
-function extract_custom_extension_value_from_raw_der(cert: crypto.X509Certificate, target_oid: string): Buffer | null {
-  const info_access = cert.infoAccess;
-  // Node.js X509Certificate doesn't expose custom OIDs through its API.
-  // We look for the OID in the raw DER data as a fallback.
-  const raw = cert.raw;
-  const oid_parts = target_oid.split(".").map(Number);
-
-  // Encode the OID in DER format for searching
-  const encoded_oid_bytes: number[] = [];
-  encoded_oid_bytes.push(40 * oid_parts[0]! + oid_parts[1]!);
-  for (let i = 2; i < oid_parts.length; i++) {
-    let value = oid_parts[i]!;
-    if (value < 128) {
-      encoded_oid_bytes.push(value);
-    } else {
-      const temp: number[] = [];
-      temp.push(value & 0x7f);
-      value >>= 7;
-      while (value > 0) {
-        temp.push((value & 0x7f) | 0x80);
-        value >>= 7;
-      }
-      temp.reverse();
-      encoded_oid_bytes.push(...temp);
+export async function resolve_agent_identity_at_airs_registry(agent_identity_urn: string): Promise<RegistryResolutionOfAgentIdentity> {
+  const rdap_url = `${AIRS_RDAP_BASE_URL}/rdap/aid_identity/${encodeURIComponent(agent_identity_urn)}`;
+  let data: Record<string, any>;
+  try {
+    data = await fetch_json_document(rdap_url, "application/rdap+json") as Record<string, any>;
+  } catch (lookup_error) {
+    if (lookup_error instanceof PermanentHttpError) {
+      throw new RegistrarAuthorityValidationError(`AIRS Registry does not resolve '${agent_identity_urn}' (HTTP ${lookup_error.status})`);
     }
-  }
-
-  const oid_buffer = Buffer.from(encoded_oid_bytes);
-
-  // Search for the OID in the raw DER
-  let search_offset = 0;
-  while (search_offset < raw.length - oid_buffer.length) {
-    const found_at = raw.indexOf(oid_buffer, search_offset);
-    if (found_at === -1) { break; }
-
-    // The extension value follows: OID -> critical flag -> OCTET STRING wrapping the value
-    // Walk past the OID to find the OCTET STRING (tag 0x04) containing the value
-    let pos = found_at + oid_buffer.length;
-    // Skip past remaining TLV structures until we find the OCTET STRING
-    let depth = 0;
-    while (pos < raw.length && depth < 20) {
-      const tag = raw[pos]!;
-      if (tag === 0x04) { // OCTET STRING
-        pos++;
-        let octet_length = raw[pos]!;
-        pos++;
-        if (octet_length > 127) {
-          const num_length_bytes = octet_length & 0x7f;
-          octet_length = 0;
-          for (let j = 0; j < num_length_bytes; j++) {
-            octet_length = (octet_length << 8) | raw[pos]!;
-            pos++;
-          }
-        }
-        return raw.subarray(pos, pos + octet_length);
-      }
-      // Skip this TLV
-      pos++;
-      if (pos >= raw.length) { break; }
-      let skip_length = raw[pos]!;
-      pos++;
-      if (skip_length > 127) {
-        const num_bytes = skip_length & 0x7f;
-        skip_length = 0;
-        for (let j = 0; j < num_bytes; j++) {
-          skip_length = (skip_length << 8) | raw[pos]!;
-          pos++;
-        }
-      }
-      pos += skip_length;
-      depth++;
+    if (lookup_error instanceof SyntaxError) {
+      throw new RegistrarAuthorityValidationError(`RDAP answer for '${agent_identity_urn}' is not JSON`);
     }
-
-    search_offset = found_at + 1;
+    throw lookup_error;
   }
-
-  return null;
+  if (data == null || typeof data !== "object" || data["objectClassName"] !== "aid_agentIdentity") {
+    throw new RegistrarAuthorityValidationError(`RDAP answer for '${agent_identity_urn}' is not an aid_agentIdentity object`);
+  }
+  const aid_data = data["aid_data"];
+  if (aid_data == null || typeof aid_data !== "object") {
+    throw new RegistrarAuthorityValidationError(`RDAP answer for '${agent_identity_urn}' has no aid_data`);
+  }
+  if (data["handle"] !== agent_identity_urn || aid_data["canonical"] !== agent_identity_urn) {
+    throw new RegistrarAuthorityValidationError(`RDAP answer names '${aid_data["canonical"]}', not the requested '${agent_identity_urn}'`);
+  }
+  if (aid_data["lifecycleState"] !== "operational") {
+    throw new RegistrarAuthorityValidationError(
+      `AIRS identity '${agent_identity_urn}' has lifecycleState '${aid_data["lifecycleState"]}' (must be operational)`);
+  }
+  const current_issuer = aid_data["currentIssuer"];
+  if (typeof current_issuer !== "string" || !current_issuer) {
+    throw new RegistrarAuthorityValidationError(`AIRS identity '${agent_identity_urn}' has no current issuer`);
+  }
+  const registration_event = (Array.isArray(data["events"]) ? data["events"] : [])
+    .find((event: any) => event && event["eventAction"] === "registration");
+  return {
+    current_issuer,
+    hardware_locked: aid_data["hardwareLocked"] === true,
+    registered_at: registration_event?.["eventDate"] ?? "",
+    max_active_trust_tier: aid_data["maxActiveTrustTier"] ?? "",
+  };
 }
 
-function verify_certificate_chain_signatures(chain: crypto.X509Certificate[]): void {
-  for (let i = 0; i < chain.length - 1; i++) {
-    const child = chain[i]!;
-    const parent = chain[i + 1]!;
-    if (!child.checkIssued(parent)) {
-      throw new CertificateChainValidationError(
-        `Certificate at position ${i} is not issued by certificate at position ${i + 1}`
-      );
+/** The issuer's signing keys, ONLY from its RFC 8414 metadata jwks_uri (metadata
+ * issuer must equal the issuer). Cached per issuer for 5 minutes. */
+export async function fetch_issuer_jwk_set_via_rfc8414_metadata(issuer_uri: string): Promise<Array<Record<string, unknown>>> {
+  const cached = issuer_jwk_set_cache.get(issuer_uri);
+  if (cached && Date.now() - cached.fetched_at < RFC8414_JWK_SET_CACHE_MILLISECONDS) { return cached.keys; }
+  let parsed_issuer: URL;
+  try { parsed_issuer = new URL(issuer_uri); } catch {
+    throw new RegistrarAuthorityValidationError(`issuer '${issuer_uri}' is not a URL`);
+  }
+  if (parsed_issuer.protocol !== "https:" || parsed_issuer.search || parsed_issuer.hash) {
+    throw new RegistrarAuthorityValidationError(`issuer '${issuer_uri}' is not an https issuer identifier (RFC 8414)`);
+  }
+  const metadata_url = `https://${parsed_issuer.host}/.well-known/oauth-authorization-server${parsed_issuer.pathname.replace(/\/+$/, "")}`;
+  const load = async (url: string, what: string): Promise<Record<string, any>> => {
+    try {
+      return await fetch_json_document(url) as Record<string, any>;
+    } catch (load_error) {
+      if (load_error instanceof PermanentHttpError) {
+        throw new RegistrarAuthorityValidationError(`${what} unavailable (HTTP ${load_error.status})`);
+      }
+      throw load_error;
     }
+  };
+  const metadata = await load(metadata_url, `RFC 8414 metadata for '${issuer_uri}'`);
+  if (metadata["issuer"] !== issuer_uri) {
+    throw new RegistrarAuthorityValidationError(`RFC 8414 metadata issuer '${metadata["issuer"]}' does not equal '${issuer_uri}'`);
+  }
+  const jwks_uri = metadata["jwks_uri"];
+  if (typeof jwks_uri !== "string" || !jwks_uri.startsWith("https://")) {
+    throw new RegistrarAuthorityValidationError(`RFC 8414 metadata for '${issuer_uri}' has no https jwks_uri`);
+  }
+  const jwk_set = await load(jwks_uri, `JWK Set ${jwks_uri}`);
+  const keys = jwk_set?.["keys"];
+  if (!Array.isArray(keys)) { throw new RegistrarAuthorityValidationError(`JWK Set ${jwks_uri} has no keys array`); }
+  issuer_jwk_set_cache.set(issuer_uri, { fetched_at: Date.now(), keys });
+  return keys;
+}
+
+function public_key_from_jwk(jwk: Record<string, unknown>): crypto.KeyObject {
+  if (["d", "p", "q", "dp", "dq", "qi", "k"].some((member) => member in jwk)) {
+    throw new Error("JWK contains private key members");
+  }
+  if (jwk["kty"] === "EC" && !["P-256", "P-384"].includes(String(jwk["crv"]))) {
+    throw new Error(`unsupported EC curve '${jwk["crv"]}'`);
+  }
+  if (jwk["kty"] !== "EC" && jwk["kty"] !== "RSA") { throw new Error(`unsupported JWK kty '${jwk["kty"]}'`); }
+  const public_members = jwk["kty"] === "EC"
+    ? { kty: "EC", crv: jwk["crv"], x: jwk["x"], y: jwk["y"] }
+    : { kty: "RSA", n: jwk["n"], e: jwk["e"] };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- @types/node lacks a JsonWebKey input type here
+  return crypto.createPublicKey({ key: public_members as any, format: "jwk" });
+}
+
+function jws_signature_is_valid(public_key: crypto.KeyObject, alg: string, signing_input: Buffer, signature: Buffer): boolean {
+  try {
+    if (alg === "ES256" && public_key.asymmetricKeyType === "ec" && signature.length === 64) {
+      return crypto.verify("sha256", signing_input, { key: public_key, dsaEncoding: "ieee-p1363" }, signature);
+    }
+    if (alg === "RS256" && public_key.asymmetricKeyType === "rsa") {
+      return crypto.verify("sha256", signing_input, public_key, signature);
+    }
+    if (alg === "PS256" && public_key.asymmetricKeyType === "rsa") {
+      return crypto.verify("sha256", signing_input,
+        { key: public_key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 }, signature);
+    }
+    return false;
+  } catch {
+    return false;
   }
 }
 
-function verify_chain_terminates_at_trusted_root(
-  chain: crypto.X509Certificate[],
-  trusted_roots: crypto.X509Certificate[],
-): void {
-  if (chain.length === 0) {
-    throw new CertificateChainValidationError("Certificate chain is empty");
-  }
-
-  const chain_root = chain[chain.length - 1]!;
-  const chain_root_fingerprint = chain_root.fingerprint256;
-
-  const root_is_trusted = trusted_roots.some(
-    (root) => root.fingerprint256 === chain_root_fingerprint
-  );
-
-  if (!root_is_trusted) {
-    throw new CertificateChainValidationError(
-      `Chain root '${chain_root.subject}' is not in the set of trusted 1ID roots`
-    );
+function nonce_signature_is_valid(public_key: crypto.KeyObject, algorithm: string, nonce_bytes: Buffer, signature: Buffer): boolean {
+  try {
+    if (public_key.asymmetricKeyType === "ec") {
+      return crypto.verify("sha256", nonce_bytes,
+        { key: public_key, dsaEncoding: signature.length === 64 ? "ieee-p1363" : "der" }, signature);
+    }
+    if (public_key.asymmetricKeyType === "rsa" && algorithm === "PS256") {
+      return crypto.verify("sha256", nonce_bytes,
+        { key: public_key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 }, signature);
+    }
+    if (public_key.asymmetricKeyType === "rsa") { return crypto.verify("sha256", nonce_bytes, public_key, signature); }
+    if (public_key.asymmetricKeyType === "ed25519") { return crypto.verify(null, nonce_bytes, public_key, signature); }
+    return false;
+  } catch {
+    return false;
   }
 }
 
-function verify_nonce_signature(
-  nonce_bytes: Buffer,
-  signature_bytes: Buffer,
-  leaf_cert: crypto.X509Certificate,
-): void {
-  const public_key = leaf_cert.publicKey;
-  const key_type = public_key.asymmetricKeyType;
-
-  let signature_is_valid = false;
-
-  if (key_type === "ed25519") {
-    signature_is_valid = crypto.verify(null, nonce_bytes, public_key, signature_bytes);
-  } else if (key_type === "ec") {
-    const curve_name = public_key.asymmetricKeyDetails?.namedCurve;
-    const hash_algorithm = curve_name === "P-384" ? "sha384" : "sha256";
-    signature_is_valid = crypto.verify(hash_algorithm, nonce_bytes, public_key, signature_bytes);
-  } else if (key_type === "rsa") {
-    signature_is_valid = crypto.verify("sha256", nonce_bytes, {
-      key: public_key,
-      padding: crypto.constants.RSA_PKCS1_PADDING,
-    }, signature_bytes);
-  } else {
-    throw new SignatureVerificationError(`Unsupported public key type: ${key_type}`);
-  }
-
-  if (!signature_is_valid) {
-    throw new SignatureVerificationError(
-      "Nonce signature does not match the leaf certificate's public key"
-    );
-  }
+function base64url_json(segment: string): Record<string, any> {
+  return JSON.parse(Buffer.from(segment, "base64url").toString("utf-8")) as Record<string, any>;
 }
 
 /**
- * Validate another agent's proof bundle. Entirely offline after first trust root fetch.
- *
- * Steps:
- *   1. Parse the certificate chain from the proof bundle
- *   2. Validate the chain (each cert signed by its parent)
- *   3. Verify the chain terminates at a locally cached 1ID root
- *   4. Verify the nonce signature against the leaf certificate's public key
- *   5. Extract identity claims from the leaf cert extensions
- *
- * @param nonce_bytes The original nonce bytes that the prover was asked to sign.
- * @param proof_bundle The IdentityProofBundle from the prover.
- * @param api_base_url Override for trust root server URL (only on first call if no cache).
- * @returns VerifiedPeerIdentity with verified agent_id, trust_tier, etc.
+ * Validate another agent's proof bundle on the AIRS authority model (see the file
+ * header). api_base_url is accepted for compatibility and unused: the authority
+ * comes from the AIRS Registry and the issuer it names. Same as Python
+ * verify_peer_identity().
  */
 export async function verifyPeerIdentity(
   nonce_bytes: Buffer,
   proof_bundle: IdentityProofBundle,
-  api_base_url?: string,
+  _api_base_url?: string,
+  options: VerifyPeerIdentityOptions = {},
 ): Promise<VerifiedPeerIdentity> {
-  if (!proof_bundle.certificate_chain_pem) {
-    throw new MissingIdentityCertificateError(
-      "Proof bundle does not contain a certificate chain. " +
-      "The peer identity may be declared-tier (software only) and was enrolled " +
-      "before certificate issuance was available, or the bundle was incomplete."
-    );
+  if (nonce_bytes.length < 16) { throw new PeerVerificationError("The verifier nonce must be at least 16 bytes"); }
+  const aid = proof_bundle.agent_identity_urn ?? "";
+  if (!AID_URN_PATTERN.test(aid)) {
+    throw new PeerVerificationError(`Proof bundle carries no valid agent identity URN ('${aid}')`);
+  }
+  if (!proof_bundle.registrar_binding_jws) {
+    throw new RegistrarAuthorityValidationError(
+      "Proof bundle carries no Registrar binding (made by an SDK older than 3.1.2?); ask the peer to upgrade and sign again.");
+  }
+  const parts = proof_bundle.registrar_binding_jws.split(".");
+  if (parts.length !== 3) { throw new RegistrarAuthorityValidationError("Registrar binding is not a compact JWS"); }
+  let header: Record<string, any>;
+  let payload: Record<string, any>;
+  try {
+    header = base64url_json(parts[0]);
+    payload = base64url_json(parts[1]);
+  } catch (decode_error) {
+    throw new RegistrarAuthorityValidationError(`Registrar binding cannot be decoded: ${decode_error}`);
+  }
+  if (header["typ"] !== REGISTRAR_BINDING_JWS_TYP) {
+    throw new RegistrarAuthorityValidationError(`Registrar binding typ must be '${REGISTRAR_BINDING_JWS_TYP}'`);
+  }
+  const jws_alg = String(header["alg"] ?? "");
+  if (!ACCEPTED_BINDING_JWS_ALGORITHMS.includes(jws_alg)) {
+    throw new RegistrarAuthorityValidationError(`Registrar binding alg '${jws_alg}' is not accepted`);
+  }
+  if (payload["sub"] !== aid) { throw new RegistrarAuthorityValidationError(`Registrar binding sub '${payload["sub"]}' is not '${aid}'`); }
+  const now = Math.floor(options.reference_time_unix ?? Date.now() / 1000);
+  const skew = options.max_clock_skew_seconds ?? 300;
+  const issued_at = payload["iat"];
+  const expires_at = payload["exp"];
+  if (!Number.isInteger(issued_at) || !Number.isInteger(expires_at) || expires_at <= issued_at) {
+    throw new RegistrarAuthorityValidationError("Registrar binding needs integer iat < exp");
+  }
+  if (issued_at > now + skew) { throw new RegistrarAuthorityValidationError("Registrar binding iat is in the future"); }
+  if (expires_at < now - skew) { throw new RegistrarAuthorityValidationError("Registrar binding has expired; ask the peer to sign again"); }
+  const bound_jwk = payload["cnf"]?.["jwk"];
+  if (bound_jwk == null || typeof bound_jwk !== "object") { throw new RegistrarAuthorityValidationError("Registrar binding has no cnf.jwk"); }
+  const bound_trust_tier = String(payload["aid"]?.["trust_tier"] ?? "");
+  if (!VALID_TRUST_TIERS.includes(bound_trust_tier)) {
+    throw new RegistrarAuthorityValidationError(`Registrar binding carries no valid aid.trust_tier ('${bound_trust_tier}')`);
+  }
+  let bound_public_key: crypto.KeyObject;
+  try {
+    bound_public_key = public_key_from_jwk(bound_jwk);
+  } catch (jwk_error) {
+    throw new RegistrarAuthorityValidationError(`Registrar binding cnf.jwk is unusable: ${jwk_error}`);
   }
 
-  const chain = parse_pem_bundle_into_certificates(proof_bundle.certificate_chain_pem);
-  if (chain.length === 0) {
-    throw new CertificateChainValidationError("Proof bundle contains no parseable certificates");
+  // Authority: the Registry names the current issuer; the binding must be its.
+  const registry_answer = await (options.current_issuer_resolver ?? resolve_agent_identity_at_airs_registry)(aid);
+  if (payload["iss"] !== registry_answer.current_issuer) {
+    throw new RegistrarAuthorityValidationError(
+      `Registrar binding iss '${payload["iss"]}' is not the Registry's current issuer '${registry_answer.current_issuer}'`);
   }
-
-  const trusted_roots = await get_trust_roots(api_base_url);
-
-  verify_certificate_chain_signatures(chain);
-  verify_chain_terminates_at_trusted_root(chain, trusted_roots);
-
-  const leaf_cert = chain[0]!;
-
-  const now = new Date();
-  const not_before = new Date(leaf_cert.validFrom);
-  const not_after = new Date(leaf_cert.validTo);
-  if (not_before > now) {
-    throw new CertificateChainValidationError(
-      `Leaf certificate is not yet valid (not_before: ${leaf_cert.validFrom})`
-    );
+  const issuer_keys = await (options.issuer_jwk_set_provider ?? fetch_issuer_jwk_set_via_rfc8414_metadata)(registry_answer.current_issuer);
+  const signing_input = Buffer.from(`${parts[0]}.${parts[1]}`, "ascii");
+  const jws_signature = Buffer.from(parts[2], "base64url");
+  const binding_signature_valid = issuer_keys
+    .filter((key) => key != null && typeof key === "object" && (header["kid"] == null || key["kid"] === header["kid"]))
+    .some((candidate_jwk) => {
+      try {
+        return jws_signature_is_valid(public_key_from_jwk(candidate_jwk), jws_alg, signing_input, jws_signature);
+      } catch {
+        return false;
+      }
+    });
+  if (!binding_signature_valid) {
+    throw new RegistrarAuthorityValidationError(
+      `Registrar binding is not signed by a key of '${registry_answer.current_issuer}' (RFC 8414 jwks_uri)`);
   }
-  if (not_after < now) {
-    throw new CertificateChainValidationError(
-      `Leaf certificate has expired (not_after: ${leaf_cert.validTo})`
-    );
+  if (!nonce_signature_is_valid(bound_public_key, proof_bundle.algorithm, nonce_bytes, Buffer.from(proof_bundle.signature_b64, "base64"))) {
+    throw new SignatureVerificationError("The nonce signature was not made by the key the Registrar bound to this identity");
   }
-
-  const signature_bytes = Buffer.from(proof_bundle.signature_b64, "base64");
-  verify_nonce_signature(nonce_bytes, signature_bytes, leaf_cert);
-
-  // Extract custom extensions from the leaf certificate
-  const trust_tier_raw = extract_custom_extension_value_from_raw_der(leaf_cert, ONEID_OID_TRUST_TIER);
-  const enrolled_at_raw = extract_custom_extension_value_from_raw_der(leaf_cert, ONEID_OID_ENROLLED_AT);
-  const hardware_locked_raw = extract_custom_extension_value_from_raw_der(leaf_cert, ONEID_OID_HARDWARE_LOCKED);
-
-  const verified_trust_tier = trust_tier_raw ? trust_tier_raw.toString("utf-8") : proof_bundle.trust_tier;
-  const verified_enrolled_at = enrolled_at_raw ? enrolled_at_raw.toString("utf-8") : "";
-  const verified_hardware_locked = hardware_locked_raw ? hardware_locked_raw[0] === 0x01 : false;
-
-  // Try to extract agent_id from SAN URI
-  let verified_agent_id = proof_bundle.agent_id;
-  const san_string = leaf_cert.subjectAltName ?? "";
-  const uri_match = san_string.match(/URI:urn:aid:[^:]+:([^\s,]+)/);
-  if (uri_match) {
-    verified_agent_id = uri_match[1]!;
-  }
-
   return {
-    agent_id: verified_agent_id,
-    trust_tier: verified_trust_tier,
-    enrolled_at: verified_enrolled_at,
-    hardware_locked: verified_hardware_locked,
+    agent_id: aid.slice(aid.lastIndexOf(":") + 1),
+    trust_tier: bound_trust_tier,
+    enrolled_at: registry_answer.registered_at,
+    hardware_locked: registry_answer.hardware_locked,
     chain_valid: true,
+    agent_identity_urn: aid,
+    issuer: registry_answer.current_issuer,
+    registrar_binding_expires_at: expires_at,
   };
 }
+
+/** Python-style names (the Python SDK's sign_challenge / verify_peer_identity). */
+export const sign_challenge = signChallenge;
+export const verify_peer_identity = verifyPeerIdentity;

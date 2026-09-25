@@ -14,7 +14,7 @@
 import { load_credentials, save_credentials, type StoredCredentials } from "./credentials.js";
 import { get_token } from "./auth.js";
 import { OneIDAPIClient } from "./client.js";
-import { OneIDError } from "./exceptions.js";
+import { ColocationTimingViolationError, DeviceManagementError, OneIDError, raise_from_server_error_response } from "./exceptions.js";
 import { invalidate_world_cache } from "./world.js";
 
 export interface DeviceInfo {
@@ -71,19 +71,23 @@ export interface BurnConfirmResult {
   new_trust_tier: string | null;
 }
 
-export class DeviceManagementError extends OneIDError {
-  constructor(message: string, error_code?: string) {
-    super(message, error_code ?? "DEVICE_MANAGEMENT_ERROR");
-    this.name = "DeviceManagementError";
-  }
-}
+export {
+  DeviceManagementError, DowngradeRejectedError, ColocationRequiredError, ColocationBindingError,
+  ColocationSessionExpiredError, ColocationTimingViolationError, DeviceAlreadyBoundError,
+  LastDeviceBurnRejectedError, BurnConfirmationExpiredError, HardwareLockedError,
+  IdentityAlreadyLockedError, DeclaredTierCannotBeLockedError, TooManyActiveDevicesForLockError,
+} from "./exceptions.js";
 
 function _raise_from_device_api_error_code(response_data: Record<string, unknown>): void {
   if (response_data.ok) { return; }
   const error_info = (response_data.error ?? {}) as Record<string, unknown>;
   const error_code = (error_info.code ?? "UNKNOWN") as string;
   const error_message = (error_info.message ?? "Device management operation failed") as string;
-  throw new DeviceManagementError(error_message, error_code);
+  if (error_code === "TIMING_VIOLATION") {
+    throw new ColocationTimingViolationError(error_message,
+      (error_info.elapsed_ms as number | undefined) ?? null, (error_info.severity as string | undefined) ?? null);
+  }
+  raise_from_server_error_response(error_code, error_message);
 }
 
 /**

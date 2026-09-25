@@ -51,7 +51,7 @@ RFC: `draft-drake-email-hardware-attestation-03` Section 3, `draft-drake-agent-i
 | Tier | Hardware | Sybil Resistant | Trust Level |
 |------|----------|-----------------|-------------|
 | `sovereign` | TPM (Intel, AMD, Infineon) with valid cert | Yes | Highest |
-| `portable` | YubiKey / Nitrokey / Feitian with PIV attestation | Yes | High |
+| `portable` | YubiKey with PIV attestation (other PIV vendors are not yet accepted) | Yes | High |
 | `virtual` | VMware / Hyper-V / QEMU vTPM | No | Verified Hardware |
 | `declared` | None (software keys) | No | Software |
 
@@ -99,6 +99,25 @@ if (!oneid.credentials_exist()) {
   await oneid.enroll({ request_tier: "declared" });
 }
 ```
+
+## Verifying another agent (peer verification)
+
+```typescript
+import * as crypto from "node:crypto";
+import { signChallenge, verifyPeerIdentity } from "1id";
+
+const nonce = crypto.randomBytes(32);            // verifier: a fresh challenge
+const bundle = await signChallenge(nonce);       // prover: enrolled key + Registrar binding
+const peer = await verifyPeerIdentity(nonce, bundle);  // verifier
+console.log(peer.agent_identity_urn, peer.trust_tier, peer.hardware_locked);
+```
+
+The verifier resolves the peer's identity at the AIRS Registry (it must be
+operational), takes the current issuer from there, checks the Registrar binding
+against that issuer's published keys, then checks the nonce signature with the
+bound key. Trust tier and identity facts never come from the bundle. Online by
+design (a decommissioned identity fails); the Python SDK (`verify_peer_identity`)
+is equivalent and bundles are interchangeable.
 
 ## Error Handling
 

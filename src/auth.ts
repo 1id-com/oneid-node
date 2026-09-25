@@ -17,7 +17,7 @@
  *   Direct Keycloak token endpoint is blocked by nginx to external clients.
  */
 
-import { type StoredCredentials, load_credentials } from "./credentials.js";
+import { type StoredCredentials, load_credentials, local_signing_device_type_for_credentials } from "./credentials.js";
 import { AuthenticationError, HardwareDeviceNotPresentError, NetworkError } from "./exceptions.js";
 import type { Token } from "./identity.js";
 import { OneIDAPIClient } from "./client.js";
@@ -31,12 +31,25 @@ import {
 const TOKEN_REFRESH_MARGIN_MILLISECONDS = 60_000;
 const TOKEN_REQUEST_TIMEOUT_MILLISECONDS = 15_000;
 
-const TIERS_REQUIRING_HARDWARE_AUTH = new Set(["sovereign", "portable", "enclave", "virtual"]);
-const TIERS_USING_TPM = new Set(["sovereign", "virtual"]);
-const TIERS_USING_PIV = new Set(["portable"]);
-const TIERS_USING_ENCLAVE = new Set(["enclave"]);
+/**
+ * Token cache, one entry per identity (AUD-F55): a process can hold several AIRS
+ * identities; a cached token is returned only for the identity (token endpoint,
+ * client, enrolled key) it was issued to. Same keying as the Python SDK.
+ */
+const cached_tokens_by_identity = new Map<string, Token>();
 
-let cached_token: Token | null = null;
+function token_cache_key_for_credentials(credentials: StoredCredentials): string {
+  return JSON.stringify([
+    credentials.token_endpoint || credentials.api_base_url || "",
+    credentials.client_id || "",
+    credentials.hsm_key_reference || "",
+    crypto.createHash("sha256").update(credentials.private_key_pem || "", "utf-8").digest("hex"),
+  ]);
+}
+
+function remember_token_for_credentials(credentials: StoredCredentials, token: Token): void {
+  cached_tokens_by_identity.set(token_cache_key_for_credentials(credentials), token);
+}
 
 /**
  * Get a valid OAuth2 access token, refreshing if needed.
@@ -61,6 +74,11 @@ export async function get_token(
   force_refresh: boolean = false,
   credentials?: StoredCredentials | null,
 ): Promise<Token> {
+  if (credentials == null) {
+    credentials = load_credentials();
+  }
+
+  const cached_token = cached_tokens_by_identity.get(token_cache_key_for_credentials(credentials));
   if (!force_refresh && cached_token != null) {
     const margin_adjusted_expiry = new Date(cached_token.expires_at.getTime() - TOKEN_REFRESH_MARGIN_MILLISECONDS);
     if (new Date() < margin_adjusted_expiry) {
@@ -68,67 +86,46 @@ export async function get_token(
     }
   }
 
-  if (credentials == null) {
-    credentials = load_credentials();
-  }
-
-  if (TIERS_REQUIRING_HARDWARE_AUTH.has(credentials.trust_tier)) {
-    const token = await authenticate_with_hardware_challenge_response(credentials);
-    cached_token = token;
-    return token;
-  }
-
-  const token = await authenticate_with_declared_software_key(credentials);
-  cached_token = token;
+  const device_type = local_signing_device_type_for_credentials(credentials);
+  const token = (device_type === "piv" || device_type === "enclave" || device_type === "tpm")
+    ? await authenticate_with_hardware_challenge_response(credentials)
+    : await authenticate_with_declared_software_key(credentials);
+  remember_token_for_credentials(credentials, token);
   return token;
 }
 
+/**
+ * Route to PIV, TPM or Secure Enclave challenge-response by the ENROLLED LOCAL
+ * DEVICE (local_signing_device_type_for_credentials: hsm_key_reference first,
+ * the trust tier only as the fallback), because an identity's tier and its local
+ * device differ after recovery or device addition (AUD-F66, AUD-LOST1). Same
+ * rule as the Python SDK. Never falls back to client_credentials.
+ */
 async function authenticate_with_hardware_challenge_response(credentials: StoredCredentials): Promise<Token> {
-  const local_device_is_piv = (credentials.hsm_key_reference ?? "").startsWith("piv-");
-
-  if (local_device_is_piv || TIERS_USING_PIV.has(credentials.trust_tier)) {
-    try {
-      return await authenticate_with_piv(null, null, credentials);
-    } catch (error) {
-      if (error instanceof HardwareDeviceNotPresentError) { throw error; }
-      throw new HardwareDeviceNotPresentError(
-        `PIV authentication failed and hardware is required for ` +
-        `${credentials.trust_tier} tier. YubiKey may be absent or ` +
-        `inaccessible: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
+  const device_type = local_signing_device_type_for_credentials(credentials);
+  const authenticators: Record<string, [string, string, () => Promise<Token>]> = {
+    piv: ["PIV", "YubiKey", () => authenticate_with_piv(null, null, credentials)],
+    tpm: ["TPM", "Device", () => authenticate_with_tpm(null, null, null, credentials)],
+    enclave: ["Secure Enclave", "Enclave", () => authenticate_with_enclave(null, null, credentials)],
+  };
+  const selected = device_type != null ? authenticators[device_type] : undefined;
+  if (selected === undefined) {
+    throw new HardwareDeviceNotPresentError(
+      `Trust tier '${credentials.trust_tier}' requires hardware but no ` +
+      `supported authentication method is available.`
+    );
   }
-
-  if (TIERS_USING_TPM.has(credentials.trust_tier)) {
-    try {
-      return await authenticate_with_tpm(null, null, null, credentials);
-    } catch (error) {
-      if (error instanceof HardwareDeviceNotPresentError) { throw error; }
-      throw new HardwareDeviceNotPresentError(
-        `TPM authentication failed and hardware is required for ` +
-        `${credentials.trust_tier} tier. Device may be absent or ` +
-        `inaccessible: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
+  const [mechanism_name, device_name, authenticate] = selected;
+  try {
+    return await authenticate();
+  } catch (error) {
+    if (error instanceof HardwareDeviceNotPresentError) { throw error; }
+    throw new HardwareDeviceNotPresentError(
+      `${mechanism_name} authentication failed and hardware is required for ` +
+      `${credentials.trust_tier} tier. ${device_name} may be absent or ` +
+      `inaccessible: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
-
-  if (TIERS_USING_ENCLAVE.has(credentials.trust_tier)) {
-    try {
-      return await authenticate_with_enclave(null, null, credentials);
-    } catch (error) {
-      if (error instanceof HardwareDeviceNotPresentError) { throw error; }
-      throw new HardwareDeviceNotPresentError(
-        `Secure Enclave authentication failed and hardware is required for ` +
-        `${credentials.trust_tier} tier. Enclave may be absent or ` +
-        `inaccessible: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
-
-  throw new HardwareDeviceNotPresentError(
-    `Trust tier '${credentials.trust_tier}' requires hardware but no ` +
-    `supported authentication method is available.`
-  );
 }
 
 /**
@@ -292,7 +289,7 @@ export async function authenticate_with_declared_software_key(
  * Useful for testing or when credentials have changed.
  */
 export function clear_cached_token(): void {
-  cached_token = null;
+  cached_tokens_by_identity.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -410,7 +407,7 @@ export async function authenticate_with_tpm(
       confirmation_jwk: confirmation_jwk_from_access_token(tokens.access_token as string),
       server_clock_offset_seconds: server_clock_offset_seconds_from_access_token(tokens.access_token as string),
     };
-    cached_token = token;
+    remember_token_for_credentials(credentials, token);
     return token;
   } else {
     throw new AuthenticationError(
@@ -508,7 +505,7 @@ export async function authenticate_with_piv(
       confirmation_jwk: confirmation_jwk_from_access_token(tokens.access_token as string),
       server_clock_offset_seconds: server_clock_offset_seconds_from_access_token(tokens.access_token as string),
     };
-    cached_token = token;
+    remember_token_for_credentials(credentials, token);
     return token;
   } else {
     throw new AuthenticationError(
@@ -610,7 +607,7 @@ export async function authenticate_with_enclave(
       confirmation_jwk: confirmation_jwk_from_access_token(tokens.access_token as string),
       server_clock_offset_seconds: server_clock_offset_seconds_from_access_token(tokens.access_token as string),
     };
-    cached_token = token;
+    remember_token_for_credentials(credentials, token);
     return token;
   } else {
     throw new AuthenticationError(

@@ -42,6 +42,55 @@ const ENCLAVE_KEY_APPLICATION_TAG = "com.1id.enclave.default";
 const ENCLAVE_KEY_STORAGE_DIRECTORY_NAME = ".1id";
 const ENCLAVE_KEY_STORAGE_SUBDIRECTORY_NAME = "enclave_keys";
 
+
+const CANONICAL_AGENT_ID_PATTERN = /^id-[a-z]{5}(-[a-z]{5}){3}$/;
+
+/**
+ * AUD-F72: a successful enrollment response must name the identity it created;
+ * never persist invented defaults. (client_secret and token_endpoint are
+ * legitimately absent: tokens are issued only against a binding proof by the
+ * enrolled key, OWN-038.) Same rule as the Python SDK.
+ */
+function require_identity_in_successful_enrollment_response(server_response: Record<string, unknown>): {
+  identity_data: Record<string, unknown>; credentials_data: Record<string, unknown>;
+  canonical_id: string; validated_trust_tier: string;
+} {
+  const identity_data = server_response["identity"];
+  if (identity_data == null || typeof identity_data !== "object") {
+    throw new EnrollmentError("Enrollment response has no identity object; nothing was saved.");
+  }
+  const identity_record = identity_data as Record<string, unknown>;
+  const canonical_id = String(identity_record["agent_id"] ?? identity_record["canonical_id"] ?? "");
+  if (!CANONICAL_AGENT_ID_PATTERN.test(canonical_id)) {
+    throw new EnrollmentError(`Enrollment response carries no valid canonical identity id (${JSON.stringify(canonical_id)}); nothing was saved.`);
+  }
+  const validated_trust_tier = String(identity_record["trust_tier"] ?? "");
+  if (!(Object.values(TrustTier) as string[]).includes(validated_trust_tier)) {
+    throw new EnrollmentError(`Enrollment response carries no valid trust tier (${JSON.stringify(validated_trust_tier)}); nothing was saved.`);
+  }
+  const credentials_data = server_response["credentials"] ?? {};
+  if (typeof credentials_data !== "object") {
+    throw new EnrollmentError("Enrollment response credentials are malformed; nothing was saved.");
+  }
+  return { identity_data: identity_record, credentials_data: credentials_data as Record<string, unknown>, canonical_id, validated_trust_tier };
+}
+
+/** After enrollment: tell the agent what happened to a requested vanity handle
+ * (same messages as the Python SDK). */
+function log_requested_vanity_handle_status(server_response: Record<string, unknown>): void {
+  const handle_info = server_response["requested_handle"] as Record<string, unknown> | undefined;
+  if (handle_info == null || typeof handle_info !== "object") { return; }
+  const handle_name = String(handle_info["handle"] ?? "");
+  console.log(`[oneid] Vanity handle requested: ${handle_name}`);
+  console.log(`[oneid] Handle status: ${String(handle_info["status"] ?? "")}`);
+  if (handle_info["status"] === "available") {
+    console.log(`[oneid] Handle ${handle_name} is available for $${Number(handle_info["annual_fee_usd"] ?? 0).toFixed(2)}/year`);
+    console.log(`[oneid] To claim this handle, visit: https://1id.com/handle/purchase?name=${handle_name.replace(/^@/, "")}`);
+  } else if (handle_info["status"] === "reserved") {
+    console.warn(`[oneid] Handle ${handle_name} is reserved: ${String(handle_info["message"] ?? "")}`);
+  }
+}
+
 /**
  * Read the SE dataRepresentation blob that oneid-se-helper saved to disk.
  *
@@ -110,7 +159,7 @@ const TIERS_REQUIRING_HSM: ReadonlySet<TrustTier> = new Set([
 /** HSM type preferences by tier. */
 const TIER_TO_HSM_TYPE_PREFERENCES: Readonly<Record<string, string[]>> = {
   [TrustTier.SOVEREIGN]: ["tpm"],
-  [TrustTier.PORTABLE]: ["yubikey", "nitrokey", "feitian", "solokeys"],
+  [TrustTier.PORTABLE]: ["yubikey"],
   [TrustTier.ENCLAVE]: ["enclave", "secure_enclave"],
   [TrustTier.VIRTUAL]: ["tpm"],
 };
@@ -143,7 +192,7 @@ export interface EnrollOptions {
   operator_email?: string | null;
   /** Optional. Vanity handle to claim (without '@' prefix). */
   requested_handle?: string | null;
-  /** Optional. Key algorithm for declared-tier enrollment. Default: 'ed25519'. */
+  /** Optional. Key algorithm for declared-tier enrollment. Default: 'ecdsa-p256' (the only software key that can also sign Version 1 Mode 1 email; 'ed25519' works for authentication only). */
   key_algorithm?: string | KeyAlgorithm | null;
   /** Optional. Override the API base URL (for testing/staging). */
   api_base_url?: string;
@@ -210,7 +259,7 @@ export async function enroll(options?: EnrollOptions): Promise<Identity> {
   }
   const tier = effective_options.request_tier as TrustTier;
 
-  return enroll_at_specific_tier(
+  const enrolled_identity = await enroll_at_specific_tier(
     tier,
     display_name,
     effective_options.operator_email ?? null,
@@ -218,6 +267,17 @@ export async function enroll(options?: EnrollOptions): Promise<Identity> {
     resolved_key_algorithm,
     api_base_url,
   );
+  // AUD-F35: an explicitly requested tier is a contract -- exactly that tier or an
+  // exception. The identity exists at the Registrar either way, so its
+  // credentials are kept and the error says what was enrolled. Same as Python.
+  if (enrolled_identity.trust_tier !== tier) {
+    throw new EnrollmentError(
+      `Requested trust tier '${tier}' but the Registrar enrolled this device as ` +
+      `'${enrolled_identity.trust_tier}' (identity ${enrolled_identity.canonical_id}; credentials saved). ` +
+      `Use it at that tier, or enroll other hardware for '${tier}'.`
+    );
+  }
+  return enrolled_identity;
 }
 
 async function enroll_at_specific_tier(
@@ -293,7 +353,12 @@ async function enroll_declared_tier(
   // Step 1: Generate keypair
   const { private_key_pem, public_key_pem } = generate_keypair(key_algorithm);
 
-  // Step 2: Send enrollment request to server
+  // Step 2: Prove possession of the new key (registry-04 Declared Tier; AUD-F67)
+  // and send the enrollment request.
+  const { build_declared_enrollment_proof_of_possession_statement, sign_challenge_with_private_key } = await import("./keys.js");
+  const proof_of_possession_signed_at_unix = Math.floor(Date.now() / 1000);
+  const proof_of_possession_signature_b64 = sign_challenge_with_private_key(private_key_pem,
+    build_declared_enrollment_proof_of_possession_statement(public_key_pem, proof_of_possession_signed_at_unix)).toString("base64");
   const api_client = new OneIDAPIClient(api_base_url);
   const server_response = await api_client.enroll_declared(
     public_key_pem,
@@ -301,13 +366,13 @@ async function enroll_declared_tier(
     operator_email,
     requested_handle,
     display_name,
+    proof_of_possession_signature_b64,
+    proof_of_possession_signed_at_unix,
   );
 
   // Step 3: Parse server response
-  const identity_data = (server_response.identity ?? {}) as Record<string, unknown>;
-  const credentials_data = (server_response.credentials ?? {}) as Record<string, unknown>;
-
-  const canonical_id = (identity_data.agent_id as string) ?? (identity_data.canonical_id as string) ?? "";
+  const { identity_data, credentials_data, canonical_id, validated_trust_tier } =
+    require_identity_in_successful_enrollment_response(server_response as Record<string, unknown>);
   const agent_identity_urn = (identity_data.agent_identity_urn as string) ?? "";
   const handle = (identity_data.handle as string) ?? `@${canonical_id}`;
   const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
@@ -319,14 +384,16 @@ async function enroll_declared_tier(
     token_endpoint: (credentials_data.token_endpoint as string) ??
       `${api_base_url}/realms/agents/protocol/openid-connect/token`,
     api_base_url,
-    trust_tier: TrustTier.DECLARED,
+    trust_tier: validated_trust_tier as TrustTier,
     key_algorithm,
     private_key_pem,
     enrolled_at: enrolled_at_str,
     display_name,
     agent_identity_urn: agent_identity_urn || null,
+    identity_certificate_chain_pem: (server_response["identity_certificate_chain_pem"] as string) ?? null,
   };
   const credentials_file_path = save_credentials(stored_credentials);
+  log_requested_vanity_handle_status(server_response as Record<string, unknown>);
   console.log(`[oneid] Credentials saved to ${credentials_file_path}`);
 
   let enrolled_at: Date;
@@ -339,7 +406,7 @@ async function enroll_declared_tier(
   return {
     canonical_id,
     handle,
-    trust_tier: TrustTier.DECLARED,
+    trust_tier: validated_trust_tier as TrustTier,
     hsm_type: HSMType.SOFTWARE,
     hsm_manufacturer: null,
     enrolled_at,
@@ -351,7 +418,7 @@ async function enroll_declared_tier(
 }
 
 /**
- * Enroll at the portable tier using a PIV device (YubiKey/Nitrokey/Feitian).
+ * Enroll at the portable tier using a YubiKey (PIV attestation; the only PIV vendor the Registrar accepts today).
  *
  * This uses the Go binary (oneid-enroll) to:
  * 1. Detect available HSMs and select a PIV device
@@ -406,6 +473,7 @@ async function enroll_piv_tier(
       (selected_hsm.type as string) ?? "yubikey",
       operator_email,
       requested_handle,
+      display_name,
     );
   } catch (enroll_begin_piv_error) {
     if (enroll_begin_piv_error instanceof AlreadyEnrolledError) {
@@ -449,13 +517,11 @@ async function enroll_piv_tier(
     );
   }
 
-  const identity_data = (activate_response.identity ?? {}) as Record<string, unknown>;
-  const credentials_data = (activate_response.credentials ?? {}) as Record<string, unknown>;
-
-  const canonical_id = (identity_data.agent_id as string) ?? (identity_data.canonical_id as string) ?? "";
+  const { identity_data, credentials_data, canonical_id, validated_trust_tier } =
+    require_identity_in_successful_enrollment_response(activate_response as Record<string, unknown>);
   const agent_identity_urn = (identity_data.agent_identity_urn as string) ?? "";
   const handle = (identity_data.handle as string) ?? `@${canonical_id}`;
-  const trust_tier_str = (identity_data.trust_tier as string) ?? request_tier;
+  const trust_tier_str: string = validated_trust_tier;
   const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
 
   const stored_credentials: StoredCredentials = {
@@ -472,6 +538,7 @@ async function enroll_piv_tier(
     agent_identity_urn: agent_identity_urn || null,
   };
   save_credentials(stored_credentials);
+  log_requested_vanity_handle_status(activate_response as Record<string, unknown>);
 
   let enrolled_at: Date;
   try {
@@ -531,9 +598,13 @@ async function enroll_enclave_tier(
   display_name: string | null,
   api_base_url: string,
 ): Promise<Identity> {
-  const { detect_available_hsms, sign_challenge_with_enclave } = await import("./helper.js");
+  const { detect_available_hsms, ensure_secure_enclave_helper_available, sign_challenge_with_enclave } = await import("./helper.js");
 
   console.log("[oneid] Enrolling at enclave tier (Apple Secure Enclave required)");
+
+  // OWN-030: oneid-enroll delegates to oneid-se-helper next to it; fetch the
+  // verified helper into the cache now instead of requiring a manual copy.
+  await ensure_secure_enclave_helper_available();
 
   const detected_hsms = await detect_available_hsms();
 
@@ -579,10 +650,8 @@ async function enroll_enclave_tier(
     signed_nonce_b64,
   );
 
-  const identity_data = (activate_response["identity"] ?? {}) as Record<string, unknown>;
-  const credentials_data = (activate_response["credentials"] ?? {}) as Record<string, unknown>;
-
-  const canonical_id = (identity_data["agent_id"] ?? identity_data["canonical_id"] ?? "") as string;
+  const { identity_data, credentials_data, canonical_id, validated_trust_tier } =
+    require_identity_in_successful_enrollment_response(activate_response as Record<string, unknown>);
   const agent_identity_urn = (identity_data["agent_identity_urn"] ?? "") as string;
   const handle = (identity_data["handle"] ?? `@${canonical_id}`) as string;
   const trust_tier_str = (identity_data["trust_tier"] ?? "enclave") as string;
@@ -616,7 +685,7 @@ async function enroll_enclave_tier(
   return {
     canonical_id,
     handle,
-    trust_tier: TrustTier.ENCLAVE,
+    trust_tier: validated_trust_tier as TrustTier,
     hsm_type: HSMType.SECURE_ENCLAVE,
     hsm_manufacturer: "AAPL",
     enrolled_at: new Date(enrolled_at_str),
@@ -677,6 +746,7 @@ async function enroll_hsm_tier(
       (selected_hsm.type as string) ?? "tpm",
       operator_email,
       requested_handle,
+      display_name,
     );
     const proof = await import_and_certify_wrapped_object_with_tpm(
       begin_response.wrapped_object_public as string,
@@ -719,13 +789,11 @@ async function enroll_hsm_tier(
   }
 
   // Step 7: Store credentials and return Identity
-  const identity_data = (activate_response.identity ?? {}) as Record<string, unknown>;
-  const credentials_data = (activate_response.credentials ?? {}) as Record<string, unknown>;
-
-  const canonical_id = (identity_data.agent_id as string) ?? (identity_data.canonical_id as string) ?? "";
+  const { identity_data, credentials_data, canonical_id, validated_trust_tier } =
+    require_identity_in_successful_enrollment_response(activate_response as Record<string, unknown>);
   const agent_identity_urn = (identity_data.agent_identity_urn as string) ?? "";
   const handle = (identity_data.handle as string) ?? `@${canonical_id}`;
-  const trust_tier_str = (identity_data.trust_tier as string) ?? request_tier;
+  const trust_tier_str: string = validated_trust_tier;
   const enrolled_at_str = (identity_data.registered_at as string) ?? new Date().toISOString();
 
   const stored_credentials: StoredCredentials = {
@@ -742,6 +810,7 @@ async function enroll_hsm_tier(
     agent_identity_urn: agent_identity_urn || null,
   };
   save_credentials(stored_credentials);
+  log_requested_vanity_handle_status(activate_response as Record<string, unknown>);
 
   let enrolled_at: Date;
   try {

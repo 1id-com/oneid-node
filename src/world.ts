@@ -78,6 +78,8 @@ export interface WorldStatus {
 
 let cached_world_status: WorldStatus | null = null;
 let cached_world_status_fetched_at: number = 0;
+// AUD-F56: the cache belongs to one identity (client_id), as in the Python SDK.
+let cached_world_status_client_id: string | null = null;
 
 /**
  * Fetch the full world state from the server.
@@ -94,15 +96,15 @@ let cached_world_status_fetched_at: number = 0;
 export async function fetch_world_status_from_server(
   credentials?: StoredCredentials | null,
 ): Promise<WorldStatus> {
-  if (cached_world_status != null) {
+  if (credentials == null) {
+    credentials = load_credentials();
+  }
+
+  if (cached_world_status != null && cached_world_status_client_id === credentials.client_id) {
     const elapsed_since_cached_fetch = Date.now() - cached_world_status_fetched_at;
     if (elapsed_since_cached_fetch < WORLD_CACHE_TTL_MILLISECONDS) {
       return cached_world_status;
     }
-  }
-
-  if (credentials == null) {
-    credentials = load_credentials();
   }
 
   const token = await get_token(false, credentials);
@@ -118,6 +120,7 @@ export async function fetch_world_status_from_server(
 
   cached_world_status = parsed_world_status;
   cached_world_status_fetched_at = Date.now();
+  cached_world_status_client_id = credentials.client_id;
 
   return parsed_world_status;
 }
@@ -128,6 +131,7 @@ export async function fetch_world_status_from_server(
 export function invalidate_world_cache(): void {
   cached_world_status = null;
   cached_world_status_fetched_at = 0;
+  cached_world_status_client_id = null;
 }
 
 function parse_world_response_to_world_status(data: Record<string, unknown>): WorldStatus {

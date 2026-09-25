@@ -160,6 +160,19 @@ export class HardwareDeviceNotPresentError extends AuthenticationError {
 }
 
 /**
+ * A requested email attestation (Mode 1 Hardware-Attestation and/or Mode 2
+ * Hardware-Trust-Proof) could not be produced, so the message was NOT sent
+ * (AUD-F28: never silently send without the proof the caller asked for).
+ * Pass require_requested_attestation: false to mailpal send() for best effort.
+ */
+export class AttestationGenerationError extends OneIDError {
+  constructor(message: string = "Requested email attestation could not be produced") {
+    super(message, "ATTESTATION_GENERATION_ERROR");
+    this.name = "AttestationGenerationError";
+  }
+}
+
+/**
  * Could not reach the 1id.com API server.
  */
 export class NetworkError extends OneIDError {
@@ -200,6 +213,80 @@ export class RateLimitExceededError extends EnrollmentError {
 }
 
 // -- Mapping from server API error codes to exception classes --
+// ---------------------------------------------------------------------------
+// Device management (same classes and hierarchy as the Python SDK's devices.py)
+// ---------------------------------------------------------------------------
+
+export class DeviceManagementError extends OneIDError {
+  constructor(message: string = "Device management operation failed", error_code?: string) {
+    super(message, error_code ?? "DEVICE_MANAGEMENT_ERROR");
+    this.name = "DeviceManagementError";
+  }
+}
+export class DowngradeRejectedError extends DeviceManagementError {
+  constructor(message: string = "Adding this device would downgrade the identity's trust tier") {
+    super(message, "DOWNGRADE_REJECTED"); this.name = "DowngradeRejectedError";
+  }
+}
+export class ColocationRequiredError extends DeviceManagementError {
+  constructor(message: string = "This device addition requires a co-location binding ceremony") {
+    super(message, "COLOCATION_REQUIRED"); this.name = "ColocationRequiredError";
+  }
+}
+export class ColocationBindingError extends DeviceManagementError {
+  constructor(message: string = "Co-location binding ceremony failed", error_code?: string) {
+    super(message, error_code ?? "COLOCATION_BINDING_FAILED"); this.name = "ColocationBindingError";
+  }
+}
+export class ColocationSessionExpiredError extends ColocationBindingError {
+  constructor(message: string = "Co-location binding session expired") {
+    super(message, "SESSION_EXPIRED"); this.name = "ColocationSessionExpiredError";
+  }
+}
+export class ColocationTimingViolationError extends ColocationBindingError {
+  public readonly elapsed_ms: number | null;
+  public readonly severity: string | null;
+  constructor(message: string = "Co-location timing violation", elapsed_ms: number | null = null, severity: string | null = null) {
+    super(message, "TIMING_VIOLATION"); this.name = "ColocationTimingViolationError";
+    this.elapsed_ms = elapsed_ms; this.severity = severity;
+  }
+}
+export class DeviceAlreadyBoundError extends DeviceManagementError {
+  constructor(message: string = "This device is already bound to an identity") {
+    super(message, "DEVICE_ALREADY_BOUND"); this.name = "DeviceAlreadyBoundError";
+  }
+}
+export class LastDeviceBurnRejectedError extends DeviceManagementError {
+  constructor(message: string = "Cannot burn the last active device of an identity") {
+    super(message, "LAST_DEVICE_BURN_REJECTED"); this.name = "LastDeviceBurnRejectedError";
+  }
+}
+export class BurnConfirmationExpiredError extends DeviceManagementError {
+  constructor(message: string = "Burn confirmation expired") {
+    super(message, "BURN_CONFIRMATION_EXPIRED"); this.name = "BurnConfirmationExpiredError";
+  }
+}
+export class HardwareLockedError extends DeviceManagementError {
+  constructor(message: string = "This identity is hardware-locked") {
+    super(message, "HARDWARE_LOCKED"); this.name = "HardwareLockedError";
+  }
+}
+export class IdentityAlreadyLockedError extends DeviceManagementError {
+  constructor(message: string = "Identity is already hardware-locked") {
+    super(message, "ALREADY_LOCKED"); this.name = "IdentityAlreadyLockedError";
+  }
+}
+export class DeclaredTierCannotBeLockedError extends DeviceManagementError {
+  constructor(message: string = "Declared-tier identities cannot be hardware-locked") {
+    super(message, "DECLARED_TIER_CANNOT_LOCK"); this.name = "DeclaredTierCannotBeLockedError";
+  }
+}
+export class TooManyActiveDevicesForLockError extends DeviceManagementError {
+  constructor(message: string = "Too many active devices for hardware lock") {
+    super(message, "TOO_MANY_ACTIVE_DEVICES"); this.name = "TooManyActiveDevicesForLockError";
+  }
+}
+
 const SERVER_ERROR_CODE_TO_EXCEPTION_CLASS: Record<string, new (message: string) => OneIDError> = {
   "EK_ALREADY_REGISTERED": AlreadyEnrolledError,
   "EK_CERT_INVALID": EnrollmentError,
@@ -210,6 +297,18 @@ const SERVER_ERROR_CODE_TO_EXCEPTION_CLASS: Record<string, new (message: string)
   "RATE_LIMIT_EXCEEDED": RateLimitExceededError,
   "RATE_LIMITED": RateLimitExceededError,
   "HARDWARE_PROOF_REQUIRED": HardwareDeviceNotPresentError,
+  // Device management (Python devices._DEVICE_ERROR_CODE_TO_EXCEPTION_CLASS)
+  "DOWNGRADE_REJECTED": DowngradeRejectedError,
+  "COLOCATION_REQUIRED": ColocationRequiredError,
+  "SESSION_EXPIRED": ColocationSessionExpiredError,
+  "TIMING_VIOLATION": ColocationTimingViolationError,
+  "TPM_RESET_DETECTED": ColocationBindingError,
+  "DEVICE_ALREADY_BOUND": DeviceAlreadyBoundError,
+  "LAST_DEVICE_BURN_REJECTED": LastDeviceBurnRejectedError,
+  "HARDWARE_LOCKED": HardwareLockedError,
+  "ALREADY_LOCKED": IdentityAlreadyLockedError,
+  "DECLARED_TIER_CANNOT_LOCK": DeclaredTierCannotBeLockedError,
+  "TOO_MANY_ACTIVE_DEVICES": TooManyActiveDevicesForLockError,
 };
 
 /**

@@ -4,8 +4,10 @@
  * Uses Node.js built-in `crypto` module -- zero external dependencies.
  *
  * Supports multiple key algorithms for declared-tier software keys:
- *   - Ed25519:     128-bit security, smallest keys, fastest. Default.
- *   - ECDSA P-256: 128-bit security, widely compatible (NIST curve).
+ *   - Ed25519:     128-bit security, smallest keys, fastest (authentication only).
+ *   - ECDSA P-256: 128-bit security, widely compatible (NIST curve). The enrollment
+ *                  default (DEFAULT_KEY_ALGORITHM): the only software key that can
+ *                  also sign Version 1 Mode 1 email.
  *   - ECDSA P-384: 192-bit security, higher security NIST curve.
  *   - RSA-2048:    112-bit security, legacy compatibility.
  *   - RSA-4096:    128-bit security, higher security RSA.
@@ -75,6 +77,17 @@ export function generate_keypair(algorithm: KeyAlgorithm = KeyAlgorithm.ED25519)
   }) as string;
 
   return { private_key_pem, public_key_pem };
+}
+
+export const DECLARED_ENROLLMENT_PROOF_OF_POSSESSION_STATEMENT_PREFIX = "1id-declared-enrollment-proof-of-possession:v1:";
+
+/** The statement a declared enrollment signs with the key it enrolls (AUD-F67;
+ * same format as the server and the Python SDK): prefix + SHA-256 hex of the
+ * SPKI DER + ":" + unix seconds. */
+export function build_declared_enrollment_proof_of_possession_statement(public_key_pem: string, signed_at_unix: number): Buffer {
+  const spki_der = crypto.createPublicKey(public_key_pem).export({ type: "spki", format: "der" });
+  const fingerprint_hex = crypto.createHash("sha256").update(spki_der).digest("hex");
+  return Buffer.from(`${DECLARED_ENROLLMENT_PROOF_OF_POSSESSION_STATEMENT_PREFIX}${fingerprint_hex}:${Math.floor(signed_at_unix)}`, "ascii");
 }
 
 /**

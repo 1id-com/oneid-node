@@ -3,7 +3,7 @@
  * three User-Agent strings used to report five different versions). Keep equal
  * to package.json "version" (a unit test enforces it).
  */
-export const SDK_VERSION = "3.1.1";
+export const SDK_VERSION = "3.1.2";
 
 /** User-Agent sent on every SDK HTTP request. */
 export const SDK_USER_AGENT = `oneid-sdk-node/${SDK_VERSION}`;

@@ -12,7 +12,7 @@
  *
  * Ordered from highest to lowest Sybil resistance:
  * - sovereign (TPM): Non-portable discrete/firmware TPM, manufacturer CA chain verifiable
- * - portable  (PIV): Portable PIV device (YubiKey/Nitrokey/Feitian), manufacturer-attested
+ * - portable  (PIV): YubiKey PIV (Yubico attestation; the only PIV vendor the Registrar accepts today), manufacturer-attested
  * - enclave   (ENC): Apple Secure Enclave (CryptoKit), hardware-backed but not Sybil-resistant
  * - virtual   (VRT): Hypervisor vTPM (VMware/Hyper-V/QEMU), hypervisor-attested
  * - declared  (SFT): Software-only, no hardware proof, works everywhere

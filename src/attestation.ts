@@ -29,7 +29,7 @@ import { createHash, constants as crypto_constants, verify as crypto_verify, X50
 import { get_token } from "./auth.js";
 import type { Token } from "./identity.js";
 import { fetch_with_airs_proof_of_possession } from "./airsHttpMessageSignatures.js";
-import { load_credentials } from "./credentials.js";
+import { load_credentials, local_signing_device_type_for_credentials } from "./credentials.js";
 import { AuthenticationError, NetworkError, NotEnrolledError } from "./exceptions.js";
 
 const _HTTP_TIMEOUT_MILLISECONDS = 15_000;
@@ -450,6 +450,20 @@ export function build_cms_signed_data_for_direct_attestation(
   ]));
 }
 
+/** True when the Registrar binding JWS's cnf.jwk is the public key of the chain's leaf. */
+export function registrar_binding_jws_confirms_certificate_leaf_key(binding_jws: string, certificate_chain_pem: string): boolean {
+  let confirmed_jwk: Record<string, unknown>;
+  try {
+    const payload = JSON.parse(Buffer.from(binding_jws.split(".")[1] ?? "", "base64url").toString("utf-8")) as Record<string, unknown>;
+    confirmed_jwk = ((payload["cnf"] as Record<string, unknown> | undefined)?.["jwk"] as Record<string, unknown> | undefined) ?? {};
+  } catch {
+    return false;
+  }
+  const leaf_jwk = public_key_jwk_of_certificate_chain_leaf(certificate_chain_pem) ?? {};
+  const compared_fields = leaf_jwk["kty"] === "EC" ? ["kty", "crv", "x", "y"] : ["kty", "n", "e"];
+  return Object.keys(leaf_jwk).length > 0 && compared_fields.every((field_name) => confirmed_jwk[field_name] === leaf_jwk[field_name]);
+}
+
 /**
  * True when the first (leaf) certificate of the chain holds the public key
  * that produced `signature_bytes` over the 72-octet attestation-input under
@@ -502,20 +516,19 @@ export async function prepare_direct_hardware_attestation(
   body: Buffer,
   agent_identity_urn?: string,
   binding_jws?: string,
+  override_signing_device_type?: "piv" | "enclave" | "tpm" | "software" | null,
+  piv_serial_number?: number,
 ): Promise<DirectAttestationProof> {
   const creds = load_credentials();
   const trust_tier = creds.trust_tier ?? "declared";
-  // AUD-F66: the active local binding decides which device signs (the same
-  // rule auth.ts uses): a PIV key reference means the YubiKey signs even when
-  // the identity-level tier is sovereign. typ follows the signing device.
-  const signing_device_type: "piv" | "enclave" | "tpm" | "software" | null =
-    ((creds.hsm_key_reference ?? "").startsWith("piv-") || trust_tier === "portable") ? "piv"
-    : trust_tier === "enclave" ? "enclave"
-    : (trust_tier === "sovereign" || trust_tier === "virtual" || creds.key_algorithm === "tpm-ak") ? "tpm"
-    : creds.private_key_pem ? "software" : null;
-  const typ_parameter = signing_device_type === "piv"
-    ? "PIV"
-    : (_TRUST_TIER_TO_RFC_TYP_PARAMETER[trust_tier] ?? "SFT");
+  // AUD-F66: the enrolled local device signs (hsm_key_reference first, the tier
+  // only as fallback -- the same rule login uses), unless the caller selects a
+  // device (Phase 3, e.g. "piv" for a plugged-in YubiKey). typ follows the device.
+  const signing_device_type = override_signing_device_type ?? local_signing_device_type_for_credentials(creds);
+  const typ_parameter = signing_device_type === "piv" ? "PIV"
+    : signing_device_type === "enclave" ? "ENC"
+    : signing_device_type === "tpm" ? ((trust_tier === "sovereign" || trust_tier === "virtual") ? (_TRUST_TIER_TO_RFC_TYP_PARAMETER[trust_tier] ?? "TPM") : "TPM")
+    : "SFT";
 
   if (!creds.identity_certificate_chain_pem) {
     throw new NotEnrolledError(
@@ -590,7 +603,7 @@ export async function prepare_direct_hardware_attestation(
   let signature_bytes: Buffer;
   if (signing_device_type === "piv") {
     const { sign_challenge_with_piv } = await import("./helper.js");
-    const result = await sign_challenge_with_piv(attestation_input_72_bytes.toString("base64"));
+    const result = await sign_challenge_with_piv(attestation_input_72_bytes.toString("base64"), piv_serial_number);
     signature_bytes = Buffer.from((result["signature_b64"] as string) ?? "", "base64");
   } else if (signing_device_type === "enclave") {
     const { sign_challenge_with_enclave } = await import("./helper.js");
@@ -607,17 +620,42 @@ export async function prepare_direct_hardware_attestation(
     throw new NotEnrolledError("No signing key available.");
   }
 
-  // AUD-F57: the CMS signer certificate must carry the key that produced this
-  // signature. Fail closed rather than package another device's certificate.
-  if (!certificate_chain_leaf_key_verifies_mode1_signature(
-      creds.identity_certificate_chain_pem, attestation_input_72_bytes, signature_bytes, algorithm_for_header)) {
+  // AUD-F81 (+F57): the CMS signer certificate must carry the key that produced
+  // this signature. The chain stored for the signing device type is tried first,
+  // then every stored chain; if none matches, fail closed instead of packaging
+  // another device's certificate -- and any bind must confirm that same key.
+  const certificate_chain_candidates: string[] = [];
+  const add_certificate_chain_candidate = (candidate: unknown): void => {
+    if (typeof candidate === "string" && candidate && !certificate_chain_candidates.includes(candidate)) {
+      certificate_chain_candidates.push(candidate);
+    }
+  };
+  const stored_device_chains = Object.values(creds.device_certificate_chains ?? {});
+  for (const chain_data of stored_device_chains) {
+    if (chain_data != null && typeof chain_data === "object" && (chain_data as Record<string, unknown>)["device_type"] === signing_device_type) {
+      add_certificate_chain_candidate((chain_data as Record<string, unknown>)["certificate_chain_pem"]);
+    }
+  }
+  add_certificate_chain_candidate(creds.identity_certificate_chain_pem);
+  for (const chain_data of stored_device_chains) {
+    add_certificate_chain_candidate(typeof chain_data === "string" ? chain_data : (chain_data as Record<string, unknown> | null)?.["certificate_chain_pem"]);
+  }
+  const certificate_chain_pem_for_this_signing_device = certificate_chain_candidates.find((candidate_chain) =>
+    certificate_chain_leaf_key_verifies_mode1_signature(candidate_chain, attestation_input_72_bytes, signature_bytes, algorithm_for_header));
+  if (certificate_chain_pem_for_this_signing_device === undefined) {
     throw new Error(
-      `The stored certificate chain does not match the ${signing_device_type} key that signed this ` +
-      "Mode 1 proof; re-sync device certificates or re-enroll before sending Mode 1.",
+      `No stored certificate chain matches the ${signing_device_type} key that signed this Mode 1 proof; ` +
+      "re-sync device certificates (sync_device_certificate_chains_from_server) or re-enroll.",
+    );
+  }
+  if (binding_jws && !registrar_binding_jws_confirms_certificate_leaf_key(binding_jws, certificate_chain_pem_for_this_signing_device)) {
+    throw new Error(
+      "The Registrar binding was issued for a different key than the device that signed " +
+      "this Mode 1 proof; send again (the binding is fetched for the signing device's key).",
     );
   }
   const cms_der_bytes = build_cms_signed_data_for_direct_attestation(
-    signature_bytes, creds.identity_certificate_chain_pem, algorithm_for_header,
+    signature_bytes, certificate_chain_pem_for_this_signing_device, algorithm_for_header,
   );
   const chain_base64 = cms_der_bytes.toString("base64");
 
@@ -804,7 +842,7 @@ async function _fetch_sd_jwt_proof_for_message(
   };
 }
 
-async function _fetch_binding_jws(
+export async function _fetch_binding_jws(
   api_base_url: string,
   token: Token,
   proof_public_key_jwk: Record<string, unknown>,
